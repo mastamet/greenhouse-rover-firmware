@@ -7,6 +7,11 @@
 #include "driver/i2c.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
 #include "sh1107.h"
 
 #define STEP_PIN             GPIO_NUM_2    
@@ -28,7 +33,94 @@
 #define I2C_MASTER_SCL_IO    GPIO_NUM_22
 #define I2C_MASTER_FREQ_HZ   100000
 
+#define STEPS_PER_METER      200.0f        // Odometer calibration scale
+
+#define WIFI_SSID            "Wokwi-GUEST"
+#define WIFI_PASS            ""
+
 static const char *TAG = "ROVER_FIRMWARE";
+
+static volatile uint32_t current_freq = 50;
+static volatile uint32_t total_steps_traveled = 0;
+static volatile int current_dir = 1;
+static volatile bool targeted_mode_active = false;
+static volatile bool sensor_slowdown_active = false;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+        esp_rom_printf("Wi-Fi Event: Connecting to virtual Wi-Fi AP...\n");
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        esp_rom_printf("Wi-Fi Event: Disconnected. Retrying connection...\n");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        esp_rom_printf("IP Address: " IPSTR "\n", IP2STR(&event->ip_info.ip));
+    }
+}
+
+static void wifi_init_sta(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_OPEN,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static esp_err_t telemetry_get_handler(httpd_req_t *req) {
+    char resp_str[256];
+    float distance_meters = (float)total_steps_traveled / STEPS_PER_METER;
+    const char *mode_str = "AUTO_CRUISE";
+    if (targeted_mode_active) mode_str = "TARGETED_MOVE";
+    else if (sensor_slowdown_active) mode_str = "SENSOR_CREEP";
+
+    snprintf(resp_str, sizeof(resp_str),
+        "{\"status\":\"online\",\"mode\":\"%s\",\"dir\":\"%s\",\"freq_hz\":%lu,\"distance_m\":%.2f,\"steps\":%lu}",
+        mode_str,
+        current_dir ? "FWD" : "REV",
+        (unsigned long)current_freq,
+        distance_meters,
+        (unsigned long)total_steps_traveled);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t telemetry_uri = {
+            .uri       = "/telemetry",
+            .method    = HTTP_GET,
+            .handler   = telemetry_get_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &telemetry_uri);
+        esp_rom_printf("HTTP Server: /telemetry endpoint registered\n");
+    }
+    return server;
+}
 
 static esp_err_t i2c_master_init(void) {
     i2c_config_t conf = {
@@ -45,7 +137,16 @@ static esp_err_t i2c_master_init(void) {
 }
 
 void app_main(void) {
-    // 1. Configure Hardware Peripherals
+    esp_rom_printf("1. APP_MAIN STARTED\n");
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    esp_rom_printf("2. NVS Flash Initialized\n");
+
     gpio_config_t dir_conf = {
         .pin_bit_mask = (1ULL << DIR_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -65,8 +166,8 @@ void app_main(void) {
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&btn_conf);
+    esp_rom_printf("3. GPIOs Configured\n");
 
-    // 2. Configure LEDC PWM Timer & Channel
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_MODE,
         .timer_num        = LEDC_TIMER,
@@ -86,8 +187,8 @@ void app_main(void) {
         .hpoint         = 0
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    esp_rom_printf("4. PWM Configured\n");
 
-    // 3. Initialize ADC for Potentiometer (GPIO 35 / ADC1 Channel 7)
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_control = { .unit_id = ADC_UNIT_1 };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_control, &adc1_handle));
@@ -97,34 +198,31 @@ void app_main(void) {
         .atten = ADC_ATTEN_DB_12,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, POT_ADC_CHANNEL, &adc_config));
+    esp_rom_printf("5. ADC Configured\n");
 
-    // 4. Initialize I2C and SH1107 OLED Display
     ESP_ERROR_CHECK(i2c_master_init());
     sh1107_init(I2C_NUM_0);
+    esp_rom_printf("6. I2C & OLED Initialized\n");
 
-    ESP_LOGI(TAG, "Greenhouse Rover Context-Aware Firmware Booted.");
+    wifi_init_sta();
+    start_webserver();
+    esp_rom_printf("7. Wi-Fi & Webserver Initialized\n");
 
-    int current_dir = 1;        
     int target_dir = 1;         
     int last_dir_btn_state = 0;
     int last_move_btn_state = 0;
     int last_sensor_btn_state = 0;
     int adc_raw = 0;
     
-    uint32_t current_freq = 50; 
     int ramp_step = 40;         
-
     int32_t target_steps_remaining = 0; 
-    bool targeted_mode_active = false;  
-    bool sensor_slowdown_active = false;
     int display_refresh_counter = 0;
+    int telemetry_print_counter = 0;
 
     while (true) {
-        // Read potentiometer speed scaling (GPIO 35)
         adc_oneshot_read(adc1_handle, POT_ADC_CHANNEL, &adc_raw);
         uint32_t potentiometer_target_freq = 50 + (adc_raw / 2); 
 
-        // --- BUTTON 1: Direction Toggle / Reversing (GPIO 5 - Red) ---
         int dir_btn_state = gpio_get_level(DIR_BUTTON_PIN);
         if (dir_btn_state == 1 && last_dir_btn_state == 0) {
             target_dir = !target_dir;            
@@ -132,7 +230,6 @@ void app_main(void) {
         }
         last_dir_btn_state = dir_btn_state;
 
-        // --- BUTTON 2: Targeted Countdown Trigger (GPIO 19 - Blue) ---
         int move_btn_state = gpio_get_level(MOVE_BUTTON_PIN);
         if (move_btn_state == 1 && last_move_btn_state == 0) {
             if (!targeted_mode_active) {
@@ -143,7 +240,6 @@ void app_main(void) {
         }
         last_move_btn_state = move_btn_state;
 
-        // --- BUTTON 3: Sensor Weed Check Toggle (GPIO 23 - Green) ---
         int sensor_btn_state = gpio_get_level(SENSOR_BUTTON_PIN);
         if (sensor_btn_state == 1 && last_sensor_btn_state == 0) {
             sensor_slowdown_active = !sensor_slowdown_active;
@@ -151,13 +247,12 @@ void app_main(void) {
         }
         last_sensor_btn_state = sensor_btn_state;
 
-        // --- FREQUENCY TARGET CALCULATION & OVERRIDES ---
         uint32_t effective_target_freq = potentiometer_target_freq;
 
         if (current_dir != target_dir) {
-            effective_target_freq = 0; // Zero-crossing brake for reversing
+            effective_target_freq = 0; 
         } else if (sensor_slowdown_active) {
-            effective_target_freq = 40; // Creep crawl speed for leaf check/weeding
+            effective_target_freq = 40; 
         } else if (targeted_mode_active && target_steps_remaining <= 0) {
             effective_target_freq = 0;
             if (current_freq == 0) {
@@ -166,7 +261,6 @@ void app_main(void) {
             }
         }
 
-        // --- ACCELERATION RAMPING ---
         if (current_freq < effective_target_freq) {
             current_freq += ramp_step;
             if (current_freq > effective_target_freq) current_freq = effective_target_freq;
@@ -179,25 +273,41 @@ void app_main(void) {
             if (current_freq < effective_target_freq) current_freq = effective_target_freq;
         }
 
-        // --- ZERO-CROSSING SWAP ---
         if (current_freq == 0 && current_dir != target_dir) {
             current_dir = target_dir;               
             gpio_set_level(DIR_PIN, current_dir);   
             ESP_LOGI(TAG, "DIR pin flipped to %d.", current_dir);
         }
 
-        // --- PWM UPDATE & STEP TRACKING ---
         if (current_freq > 0) {
             ledc_set_freq(LEDC_MODE, LEDC_TIMER, current_freq);
 
+            uint32_t steps_this_cycle = (current_freq * 30) / 1000;
+            total_steps_traveled += steps_this_cycle;
+
             if (targeted_mode_active) {
-                int32_t steps_this_cycle = (current_freq * 30) / 1000;
                 target_steps_remaining -= steps_this_cycle;
                 if (target_steps_remaining < 0) target_steps_remaining = 0;
             }
         }
 
-        // --- CONTEXT-DRIVEN MULTI-PAGE OLED UI RENDERING (~120ms rate) ---
+        // Print Telemetry JSON to Serial every ~1 second (33 loops * 30ms)
+        telemetry_print_counter++;
+        if (telemetry_print_counter >= 33) {
+            telemetry_print_counter = 0;
+            float distance_meters = (float)total_steps_traveled / STEPS_PER_METER;
+            const char *mode_str = "AUTO_CRUISE";
+            if (targeted_mode_active) mode_str = "TARGETED_MOVE";
+            else if (sensor_slowdown_active) mode_str = "SENSOR_CREEP";
+
+            esp_rom_printf("TELEMETRY: {\"status\":\"online\",\"mode\":\"%s\",\"dir\":\"%s\",\"freq_hz\":%lu,\"distance_m\":%.2f,\"steps\":%lu}\n",
+                mode_str,
+                current_dir ? "FWD" : "REV",
+                (unsigned long)current_freq,
+                distance_meters,
+                (unsigned long)total_steps_traveled);
+        }
+
         display_refresh_counter++;
         if (display_refresh_counter >= 4) {
             display_refresh_counter = 0;
@@ -205,7 +315,6 @@ void app_main(void) {
             char line_buf[32];
             sh1107_clear();
 
-            // --- UI PAGE 2: ACTION / TARGETED MOVE OVERRIDE ---
             if (targeted_mode_active) {
                 sh1107_draw_string(0, 0, "=== ACTION / WEED ===");
                 sh1107_draw_string(2, 0, "STATUS: TARGETED MOVE");
@@ -214,7 +323,6 @@ void app_main(void) {
                 snprintf(line_buf, sizeof(line_buf), "REMAIN: %ld STEPS", (long)target_steps_remaining);
                 sh1107_draw_string(6, 0, line_buf);
             }
-            // --- UI PAGE 3: SENSOR / WARNING OVERRIDE ---
             else if (sensor_slowdown_active) {
                 sh1107_draw_string(0, 0, "=== SENSOR / ALERT ===");
                 sh1107_draw_string(2, 0, "STATUS: LEAF/WEED CHECK");
@@ -224,15 +332,15 @@ void app_main(void) {
                 
                 sh1107_draw_string(6, 0, "ACTION: CREEP SLOWDOWN");
             }
-            // --- UI PAGE 1: DEFAULT / CORE DASHBOARD ---
             else {
                 sh1107_draw_string(0, 0, "GREENHOUSE ROVER");
                 sh1107_draw_string(2, 0, "MODE: AUTO CRUISE");
                 
-                snprintf(line_buf, sizeof(line_buf), "DIR:  %s", current_dir ? "FWD" : "REV");
+                snprintf(line_buf, sizeof(line_buf), "DIR:  %s | S:%luHz", current_dir ? "FWD" : "REV", (unsigned long)current_freq);
                 sh1107_draw_string(4, 0, line_buf);
 
-                snprintf(line_buf, sizeof(line_buf), "FREQ: %lu HZ", (unsigned long)current_freq);
+                float distance_meters = (float)total_steps_traveled / STEPS_PER_METER;
+                snprintf(line_buf, sizeof(line_buf), "DIST:%.1fm S:%lu", distance_meters, (unsigned long)total_steps_traveled);
                 sh1107_draw_string(6, 0, line_buf);
             }
 
