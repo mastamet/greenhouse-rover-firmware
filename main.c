@@ -5,12 +5,14 @@
  *           CRUISE > DETECTED > STOP > ALIGN > FIRE > COOLDOWN > RESUME   (weeds)
  *           CRUISE > DETECTED > STOP > INSPECT > RESUME                   (disease)
  *   Also:   signed odometry, fractional step counting, PWM actually stops at 0 Hz
+ *   Safety: PIR person detection + MPU6050 tilt cutoff gate the laser (SAFETY HOLD state)
  */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -37,6 +39,7 @@
 #define LASER_LED_PIN        GPIO_NUM_18   // Red LED    : "laser" (on only in FIRE)
 #define ALERT_LED_PIN        GPIO_NUM_27   // Yellow LED : on while engaging a target
 #define POT_ADC_CHANNEL      ADC_CHANNEL_7 // Potentiometer on GPIO 35
+#define PIR_PIN              GPIO_NUM_26   // PIR motion sensor (person nearby)
 
 /* ---------------- PWM (step pulses) ---------------- */
 #define LEDC_TIMER           LEDC_TIMER_0
@@ -50,6 +53,14 @@
 #define I2C_MASTER_SDA_IO    GPIO_NUM_21
 #define I2C_MASTER_SCL_IO    GPIO_NUM_22
 #define I2C_MASTER_FREQ_HZ   100000
+/* MPU6050 sits on its own I2C bus (separate from the OLED) */
+#define IMU_I2C_NUM          I2C_NUM_1
+#define IMU_SDA_IO           GPIO_NUM_25
+#define IMU_SCL_IO           GPIO_NUM_0    // GPIO 0 is a boot-strapping pin: keep it high at reset
+#define MPU_ADDR             0x68          // MPU6050 (AD0 low)
+#define MPU_REG_PWR_MGMT_1   0x6B
+#define MPU_REG_WHO_AM_I     0x75
+#define MPU_REG_ACCEL_XOUT_H 0x3B
 
 /* ---------------- Wi-Fi ---------------- */
 #define WIFI_SSID            "Wokwi-GUEST"
@@ -70,6 +81,16 @@
 #define COOLDOWN_MS          1000
 #define INSPECT_MS           2000
 #define RESUME_HOLDOFF_MS    1500          // ignore detections right after resuming
+
+/* Safety */
+#define TILT_LIMIT_DEG       20.0f         // block laser above this tilt
+#define TILT_CLEAR_DEG       15.0f         // allow laser again below this (hysteresis)
+#define PERSON_CLEAR_MS      2000          // PIR must be quiet this long before laser is allowed
+#define HOLD_TIMEOUT_MS      10000         // give up on a weed if unsafe for this long
+#define IMU_FAIL_LIMIT       3             // consecutive failed reads before IMU is declared faulty
+#define SAFETY_REQUIRE_IMU   1             // 1 = no IMU reading means no laser (fail-safe)
+#define IMU_ZERO_MEANS_LEVEL 1             // SIMULATION ONLY: 1 = treat an all-zero accel reading (Wokwi default sliders) as level, 0 deg. Set to 0 on real hardware.
+#define TELEMETRY_BUF        640
 
 static const char *TAG = "ROVER";
 
@@ -108,11 +129,12 @@ typedef enum {
     ST_COOLDOWN,
     ST_INSPECT,
     ST_RESUME,
+    ST_HOLD,
     ST_ESTOP,
 } rover_state_t;
 
 static const char *STATE_NAMES[] = {
-    "CRUISE", "DETECTED", "STOP", "ALIGN", "FIRE", "COOLDOWN", "INSPECT", "RESUME", "ESTOP"
+    "CRUISE", "DETECTED", "STOP", "ALIGN", "FIRE", "COOLDOWN", "INSPECT", "RESUME", "HOLD", "ESTOP"
 };
 
 /* ---------------- Shared state ---------------- */
@@ -128,6 +150,7 @@ static volatile uint32_t cnt_diseases       = 0;
 static volatile uint32_t cnt_healthy        = 0;
 static volatile uint32_t cnt_low_conf       = 0;
 static volatile uint32_t cnt_dropped        = 0;
+static volatile uint32_t cnt_blocked        = 0;   // weeds skipped because laser was unsafe
 
 static detection_t active_det;          // target currently being engaged
 static detection_t last_det;            // last accepted detection (for telemetry)
@@ -152,7 +175,7 @@ static void enter_state(rover_state_t s) {
 
     gpio_set_level(LASER_LED_PIN, s == ST_FIRE ? 1 : 0);
     bool engaged = (s == ST_DETECTED || s == ST_STOP || s == ST_ALIGN || s == ST_FIRE ||
-                    s == ST_COOLDOWN || s == ST_INSPECT || s == ST_ESTOP);
+                    s == ST_COOLDOWN || s == ST_INSPECT || s == ST_HOLD || s == ST_ESTOP);
     gpio_set_level(ALERT_LED_PIN, engaged ? 1 : 0);
 
     ESP_LOGI(TAG, ">> STATE: %s  (pos=%.2f m)", STATE_NAMES[s],
@@ -178,6 +201,133 @@ static void motor_set_freq(uint32_t f) {
         ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY_VAL);
         ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
         pwm_running = true;
+    }
+}
+
+/* ================================================================
+ *  SAFETY: person detection (PIR) + tilt (MPU6050)
+ * ================================================================ */
+typedef enum { SAFE_OK = 0, SAFE_PERSON, SAFE_TILT, SAFE_IMU } safety_t;
+static const char *SAFETY_NAMES[] = { "OK", "PERSON", "TILT", "IMU_FAULT" };
+
+static volatile bool  person_present = false;
+static volatile bool  tilt_blocked = false;
+static volatile bool  imu_ok = false;
+static volatile float tilt_deg = 0.0f;
+static volatile float imu_ax = 0, imu_ay = 0, imu_az = 0;   // last raw accel (g), for diagnostics
+static uint32_t imu_fail = 0;
+static uint32_t last_person_ms = 0;
+static bool     person_ever = false;
+
+typedef enum { IMU_READ_OK = 0, IMU_READ_NOACK, IMU_READ_NODATA } imu_read_t;
+static volatile imu_read_t imu_last_result = IMU_READ_NOACK;
+
+/* Print every I2C address that answers (OLED should be 0x3C, MPU6050 0x68) */
+static void i2c_scan(i2c_port_t port, const char *name) {
+    printf("I2C scan %s:", name);
+    int found = 0;
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+        i2c_cmd_handle_t c = i2c_cmd_link_create();
+        i2c_master_start(c);
+        i2c_master_write_byte(c, (uint8_t)((a << 1) | I2C_MASTER_WRITE), true);
+        i2c_master_stop(c);
+        esp_err_t r = i2c_master_cmd_begin(port, c, pdMS_TO_TICKS(20));
+        i2c_cmd_link_delete(c);
+        if (r == ESP_OK) { printf(" 0x%02X", a); found++; }
+    }
+    printf(found ? "\n" : " none\n");
+}
+
+static safety_t safety_reason(void) {
+    if (person_present) return SAFE_PERSON;
+    if (SAFETY_REQUIRE_IMU && !imu_ok) return SAFE_IMU;
+    if (tilt_blocked) return SAFE_TILT;
+    return SAFE_OK;
+}
+
+static i2c_port_t imu_port = IMU_I2C_NUM;
+static uint8_t    imu_addr = MPU_ADDR;
+
+/* Look for the MPU6050 on both buses at 0x68 and 0x69, wake it, and remember where it is */
+static bool imu_init(void) {
+    static const struct { i2c_port_t port; uint8_t addr; } cand[] = {
+        { IMU_I2C_NUM, 0x68 }, { IMU_I2C_NUM, 0x69 }, { I2C_MASTER_NUM, 0x68 }, { I2C_MASTER_NUM, 0x69 },
+    };
+    static int logged_port = -1, logged_addr = -1;
+    for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+        uint8_t reg = MPU_REG_WHO_AM_I, who = 0;
+        if (i2c_master_write_read_device(cand[i].port, cand[i].addr, &reg, 1, &who, 1, pdMS_TO_TICKS(30)) != ESP_OK)
+            continue;
+        uint8_t wake[2] = { MPU_REG_PWR_MGMT_1, 0x00 };   // leave sleep mode
+        i2c_master_write_to_device(cand[i].port, cand[i].addr, wake, 2, pdMS_TO_TICKS(50));
+        imu_port = cand[i].port;
+        imu_addr = cand[i].addr;
+        if (logged_port != (int)cand[i].port || logged_addr != cand[i].addr) {
+            ESP_LOGI(TAG, "MPU6050 found: %s bus, address 0x%02X, WHO_AM_I=0x%02X",
+                     cand[i].port == IMU_I2C_NUM ? "IMU" : "OLED", cand[i].addr, who);
+            logged_port = (int)cand[i].port;
+            logged_addr = cand[i].addr;
+        }
+        return true;
+    }
+    return false;
+}
+
+static imu_read_t imu_read_tilt(float *deg) {
+    uint8_t reg = MPU_REG_ACCEL_XOUT_H, raw[6];
+    if (i2c_master_write_read_device(imu_port, imu_addr, &reg, 1, raw, 6, pdMS_TO_TICKS(30)) != ESP_OK)
+        return IMU_READ_NOACK;                                   // nothing answered at this address
+    float ax = (int16_t)((raw[0] << 8) | raw[1]) / 16384.0f;   // +/-2 g range
+    float ay = (int16_t)((raw[2] << 8) | raw[3]) / 16384.0f;
+    float az = (int16_t)((raw[4] << 8) | raw[5]) / 16384.0f;
+    imu_ax = ax; imu_ay = ay; imu_az = az;
+    float horiz = sqrtf(ax * ax + ay * ay);
+    if (horiz == 0.0f && az == 0.0f) {
+        if (IMU_ZERO_MEANS_LEVEL) { *deg = 0.0f; return IMU_READ_OK; }
+        return IMU_READ_NODATA;
+    }    // answers, but all zero
+    *deg = atan2f(horiz, az) * 57.29578f;                        // angle from vertical
+    return IMU_READ_OK;
+}
+
+static void safety_update(void) {
+    uint32_t t = now_ms();
+
+    /* Person detection (PIR output stays high a while after motion; we add a further clear delay) */
+    int pir = gpio_get_level(PIR_PIN);
+    if (pir) { last_person_ms = t; person_ever = true; }
+    person_present = pir || (person_ever && (t - last_person_ms) < PERSON_CLEAR_MS);
+
+    /* Tilt */
+    float deg;
+    imu_read_t res = imu_read_tilt(&deg);
+    if (res != imu_last_result) {
+        if (res == IMU_READ_NOACK)  ESP_LOGW(TAG, "IMU: no I2C answer from the MPU6050 - check VCC, GND, SDA and SCL wiring.");
+        if (res == IMU_READ_NODATA) ESP_LOGW(TAG, "IMU: answers but all readings are zero - set its Z acceleration slider to about 1 g.");
+        imu_last_result = res;
+    }
+    if (res == IMU_READ_OK) {
+        imu_fail = 0;
+        if (!imu_ok) { imu_ok = true; ESP_LOGI(TAG, "IMU online."); }
+        tilt_deg = deg;
+        if (deg > TILT_LIMIT_DEG) tilt_blocked = true;
+        else if (deg < TILT_CLEAR_DEG) tilt_blocked = false;
+    } else {
+        imu_fail++;
+        if (imu_fail >= IMU_FAIL_LIMIT && imu_ok) {
+            imu_ok = false;
+            ESP_LOGW(TAG, "IMU not responding - laser disabled until it returns.");
+        }
+        if (imu_fail >= IMU_FAIL_LIMIT && (imu_fail % 33) == 0) imu_init();   // retry about once a second
+    }
+
+    /* Log every change of safety status */
+    static safety_t last_reason = SAFE_OK;
+    safety_t r = safety_reason();
+    if (r != last_reason) {
+        if (r == SAFE_OK) ESP_LOGI(TAG, "SAFETY: clear, laser permitted.");
+        else              ESP_LOGW(TAG, "SAFETY: laser inhibited - %s", SAFETY_NAMES[r]);
+        last_reason = r;
     }
 }
 
@@ -244,12 +394,13 @@ static void build_telemetry(char *buf, size_t n) {
         "{\"status\":\"online\",\"state\":\"%s\",\"dir\":\"%s\",\"freq_hz\":%lu,"
         "\"position_m\":%.2f,\"odometer_m\":%.2f,"
         "\"weeds_detected\":%lu,\"weeds_zapped\":%lu,\"diseases\":%lu,\"healthy\":%lu,"
-        "\"low_conf\":%lu,\"dropped\":%lu,\"last_det\":\"%s\"}",
+        "\"low_conf\":%lu,\"dropped\":%lu,\"blocked\":%lu,\"person\":%d,\"tilt_deg\":%.1f,\"safety\":\"%s\",\"last_det\":\"%s\"}",
         STATE_NAMES[rover_state], current_dir ? "FWD" : "REV", (unsigned long)current_freq,
         pos_m, odo_m,
         (unsigned long)cnt_weeds_detected, (unsigned long)cnt_weeds_zapped,
         (unsigned long)cnt_diseases, (unsigned long)cnt_healthy,
-        (unsigned long)cnt_low_conf, (unsigned long)cnt_dropped, ld);
+        (unsigned long)cnt_low_conf, (unsigned long)cnt_dropped, (unsigned long)cnt_blocked,
+        person_present ? 1 : 0, (double)tilt_deg, SAFETY_NAMES[safety_reason()], ld);
 }
 
 /* ================================================================
@@ -265,6 +416,7 @@ static void print_help(void) {
     printf(" abort                         cancel current engagement\n");
     printf(" estop / reset                 emergency stop / clear it\n");
     printf(" status                        print telemetry now\n");
+    printf(" safety                        explain why the laser is allowed/blocked\n");
     printf(" (conf default 90, offset default random -60..60)\n");
     printf("--------------------------------------------------------\n");
 }
@@ -290,6 +442,17 @@ static void handle_command(char *line) {
     else if (!strcmp(cmd, "estop"))    req_estop = true;
     else if (!strcmp(cmd, "reset"))    req_reset = true;
     else if (!strcmp(cmd, "status"))   req_status = true;
+    else if (!strcmp(cmd, "safety")) {
+        printf("SAFETY DIAG\n");
+        printf("  verdict     : %s\n", SAFETY_NAMES[safety_reason()]);
+        printf("  PIR pin     : %d  (person_present=%d)\n", gpio_get_level(PIR_PIN), person_present);
+        printf("  IMU location: %s bus, address 0x%02X\n", imu_port == IMU_I2C_NUM ? "IMU" : "OLED", imu_addr);
+        printf("  IMU result  : %s  (imu_ok=%d)\n",
+               imu_last_result == IMU_READ_OK ? "OK" : (imu_last_result == IMU_READ_NODATA ? "NODATA (all zero)" : "NOACK (no I2C answer)"), imu_ok);
+        printf("  accel g     : x=%.2f y=%.2f z=%.2f\n", (double)imu_ax, (double)imu_ay, (double)imu_az);
+        printf("  tilt        : %.1f deg  (blocked=%d, limit %.0f / clear %.0f)\n",
+               (double)tilt_deg, tilt_blocked, (double)TILT_LIMIT_DEG, (double)TILT_CLEAR_DEG);
+    }
     else if (!strcmp(cmd, "help"))     print_help();
     else printf("Unknown command '%s' (type help)\n", cmd);
 }
@@ -354,7 +517,7 @@ static void wifi_init_sta(void) {
 }
 
 static esp_err_t telemetry_get_handler(httpd_req_t *req) {
-    char resp[448];
+    char resp[TELEMETRY_BUF];
     build_telemetry(resp, sizeof(resp));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
@@ -372,18 +535,18 @@ static httpd_handle_t start_webserver(void) {
     return server;
 }
 
-static esp_err_t i2c_master_init(void) {
+static esp_err_t i2c_bus_init(i2c_port_t port, gpio_num_t sda, gpio_num_t scl) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
+        .sda_io_num = sda,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_io_num = I2C_MASTER_SCL_IO,
+        .scl_io_num = scl,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
+    esp_err_t err = i2c_param_config(port, &conf);
     if (err != ESP_OK) return err;
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    return i2c_driver_install(port, conf.mode, 0, 0, 0);
 }
 
 /* ================================================================
@@ -404,14 +567,15 @@ static const char *OLED_NAMES[] = { "NONE", "HEALTHY", "WEED", "BLIGHT", "FUNGAL
 static void render_display(void) {
     sh1107_clear();
     /* Page 0 is partly hidden by the bezel, so the layout uses pages 2-14. Max 16 chars per line. */
-    oled_line(2, "%s %s", STATE_NAMES[rover_state], current_dir ? "FWD" : "REV");
+    oled_line(2, "%s %s", STATE_NAMES[rover_state],
+              rover_state == ST_HOLD ? SAFETY_NAMES[safety_reason()] : (current_dir ? "FWD" : "REV"));
     oled_line(4, "SPEED %lu HZ", (unsigned long)current_freq);
     oled_line(6, "POS %.2f M", (float)rover_position_steps / STEPS_PER_METER);
     oled_line(8, "DIST %.1f M", (float)total_steps_traveled / STEPS_PER_METER);
 
     switch (rover_state) {
         case ST_DETECTED: case ST_STOP: case ST_ALIGN: case ST_FIRE:
-        case ST_COOLDOWN: case ST_INSPECT:
+        case ST_COOLDOWN: case ST_INSPECT: case ST_HOLD:
             oled_line(10, "%s %d%% %dMM", OLED_NAMES[active_det.type], active_det.confidence, active_det.offset_mm);
             break;
         case ST_ESTOP:
@@ -422,10 +586,11 @@ static void render_display(void) {
             else               oled_line(10, "LAST NONE");
             break;
     }
-    oled_line(12, "W%lu Z%lu D%lu",
-              (unsigned long)cnt_weeds_detected, (unsigned long)cnt_weeds_zapped, (unsigned long)cnt_diseases);
-    oled_line(14, "OK %lu SKIP %lu",
-              (unsigned long)cnt_healthy, (unsigned long)(cnt_low_conf + cnt_dropped));
+    if (!imu_ok) oled_line(12, "PIR %d IMU %s", person_present ? 1 : 0, imu_last_result == IMU_READ_NODATA ? "NODATA" : "NOACK");
+    else         oled_line(12, "PIR %d TILT %d", person_present ? 1 : 0, (int)(tilt_deg + 0.5f));
+    oled_line(14, "W%lu Z%lu D%lu B%lu",
+              (unsigned long)cnt_weeds_detected, (unsigned long)cnt_weeds_zapped,
+              (unsigned long)cnt_diseases, (unsigned long)cnt_blocked);
     sh1107_refresh();
 }
 
@@ -455,7 +620,7 @@ void app_main(void) {
 
     /* Buttons */
     gpio_config_t btn_conf = {
-        .pin_bit_mask = (1ULL << DIR_BUTTON_PIN) | (1ULL << WEED_BUTTON_PIN) | (1ULL << DISEASE_BUTTON_PIN),
+        .pin_bit_mask = (1ULL << DIR_BUTTON_PIN) | (1ULL << WEED_BUTTON_PIN) | (1ULL << DISEASE_BUTTON_PIN) | (1ULL << PIR_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
@@ -491,8 +656,12 @@ void app_main(void) {
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, POT_ADC_CHANNEL, &adc_config));
 
     /* OLED */
-    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_ERROR_CHECK(i2c_bus_init(I2C_MASTER_NUM, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));   // OLED
+    ESP_ERROR_CHECK(i2c_bus_init(IMU_I2C_NUM, IMU_SDA_IO, IMU_SCL_IO));                    // MPU6050
     sh1107_init(I2C_NUM_0);
+    i2c_scan(I2C_MASTER_NUM, "OLED bus");
+    i2c_scan(IMU_I2C_NUM, "IMU bus");
+    if (!imu_init()) ESP_LOGW(TAG, "MPU6050 not found on either bus (laser stays disabled while SAFETY_REQUIRE_IMU=1)");
 
     /* Detection queue + serial console input */
     det_queue = xQueueCreate(8, sizeof(detection_t));
@@ -534,10 +703,13 @@ void app_main(void) {
             inject_detection(DET_BLIGHT, 85, (int)(esp_random() % 121) - 60, "BTN");
         last_dis_btn = b;
 
+        /* ---------- Safety sensors ---------- */
+        safety_update();
+
         /* ---------- Serial requests ---------- */
         if (req_status) {
             req_status = false;
-            char tbuf[448];
+            char tbuf[TELEMETRY_BUF];
             build_telemetry(tbuf, sizeof(tbuf));
             printf("STATUS: %s\n", tbuf);
         }
@@ -588,6 +760,11 @@ void app_main(void) {
 
             case ST_ALIGN: {
                 drain_queue_dropped("busy");
+                if (safety_reason() != SAFE_OK) {
+                    ESP_LOGW(TAG, "FIRE BLOCKED: %s - holding up to %d s", SAFETY_NAMES[safety_reason()], HOLD_TIMEOUT_MS / 1000);
+                    enter_state(ST_HOLD);
+                    break;
+                }
                 int mm = active_det.offset_mm < 0 ? -active_det.offset_mm : active_det.offset_mm;
                 if (state_elapsed_ms() >= (uint32_t)(ALIGN_BASE_MS + mm * ALIGN_PER_MM_MS)) {
                     ESP_LOGI(TAG, "Aimed at offset %d mm. LASER ON (simulated)", active_det.offset_mm);
@@ -598,6 +775,11 @@ void app_main(void) {
 
             case ST_FIRE:
                 drain_queue_dropped("busy");
+                if (safety_reason() != SAFE_OK) {
+                    ESP_LOGW(TAG, "LASER CUT: %s - holding up to %d s", SAFETY_NAMES[safety_reason()], HOLD_TIMEOUT_MS / 1000);
+                    enter_state(ST_HOLD);
+                    break;
+                }
                 if (state_elapsed_ms() >= FIRE_MS) {
                     cnt_weeds_zapped++;
                     ESP_LOGI(TAG, "LASER OFF. Weed destroyed (total %lu).", (unsigned long)cnt_weeds_zapped);
@@ -616,6 +798,19 @@ void app_main(void) {
                     ESP_LOGW(TAG, "DISEASE FLAGGED: %s %d%% at %.2f m - needs human inspection",
                              DET_NAMES[active_det.type], active_det.confidence,
                              (float)active_det.position_steps / STEPS_PER_METER);
+                    enter_state(ST_RESUME);
+                }
+                break;
+
+            case ST_HOLD:
+                drain_queue_dropped("busy");
+                if (safety_reason() == SAFE_OK) {
+                    ESP_LOGI(TAG, "Safety clear - re-aiming.");
+                    enter_state(ST_ALIGN);
+                } else if (state_elapsed_ms() >= HOLD_TIMEOUT_MS) {
+                    cnt_blocked++;
+                    ESP_LOGW(TAG, "Weed SKIPPED (unsafe too long: %s). Blocked total %lu.",
+                             SAFETY_NAMES[safety_reason()], (unsigned long)cnt_blocked);
                     enter_state(ST_RESUME);
                 }
                 break;
@@ -661,10 +856,13 @@ void app_main(void) {
             else             rover_position_steps -= (int32_t)steps;
         }
 
+        /* ---------- Hard laser interlock: on only in FIRE and only when safe ---------- */
+        gpio_set_level(LASER_LED_PIN, (rover_state == ST_FIRE && safety_reason() == SAFE_OK) ? 1 : 0);
+
         /* ---------- Telemetry + display ---------- */
         if (++telemetry_counter >= TELEMETRY_LOOPS) {
             telemetry_counter = 0;
-            char tbuf[448];
+            char tbuf[TELEMETRY_BUF];
             build_telemetry(tbuf, sizeof(tbuf));
             printf("TELEMETRY: %s\n", tbuf);
         }
