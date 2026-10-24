@@ -7,6 +7,7 @@
 #define OLED_WIDTH      128
 #define OLED_HEIGHT     128
 #define OLED_PAGES      (OLED_HEIGHT / 8) // 16 pages
+#define OLED_COL_OFFSET 0    // 0 = original behaviour (no shift)
 
 static i2c_port_t _i2c_num;
 static uint8_t oled_buffer[OLED_PAGES][OLED_WIDTH];
@@ -109,6 +110,8 @@ void sh1107_draw_string(uint8_t page, uint8_t col, const char *str) {
             font_idx = (c - 'A') + 26; // Corrected offset for uppercase
         } else if (c >= 'a' && c <= 'z') {
             font_idx = (c - 'a') + 26; // Map lowercase to uppercase
+        } else if (c >= ' ' && c <= '/') {
+            font_idx = c - ' '; // Symbols: space ! " # $ % & ' ( ) * + , - . /
         } else {
             font_idx = 0; // Default to space
         }
@@ -130,7 +133,9 @@ void sh1107_refresh(void) {
 
         uint8_t packet[OLED_WIDTH + 1];
         packet[0] = 0x40;               
-        memcpy(&packet[1], oled_buffer[page], OLED_WIDTH);
+        for (int i = 0; i < OLED_WIDTH; i++) {
+            packet[1 + i] = oled_buffer[page][(i + OLED_COL_OFFSET) % OLED_WIDTH];
+        }
         
         i2c_master_write_to_device(_i2c_num, SH1107_I2C_ADDR, packet, sizeof(packet), pdMS_TO_TICKS(10));
     }
