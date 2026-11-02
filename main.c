@@ -6,6 +6,7 @@
  *           CRUISE > DETECTED > STOP > INSPECT > RESUME                   (disease)
  *   Also:   signed odometry, fractional step counting, PWM actually stops at 0 Hz
  *   Safety: PIR person detection + MPU6050 tilt cutoff gate the laser (SAFETY HOLD state)
+ *   Zones:  rows x zones grid, auto end-of-row turn, per-zone health records + risk map
  */
 #include <stdio.h>
 #include <string.h>
@@ -67,7 +68,23 @@
 #define WIFI_PASS            ""
 
 /* ---------------- Tuning ---------------- */
-#define STEPS_PER_METER      200.0f
+#define STEPS_PER_METER      1000.0f       // placeholder until the real wheel is known (steps/rev x microstep / wheel circumference)
+
+/* Greenhouse layout */
+#define NUM_ROWS             3
+#define ZONES_PER_ROW        5
+#define ZONE_LENGTH_M        2.0f
+#define ROW_LENGTH_M         (ZONES_PER_ROW * ZONE_LENGTH_M)
+#define ROW_LENGTH_STEPS     ((int32_t)(ROW_LENGTH_M * STEPS_PER_METER))
+#define APPROACH_ZONE_M      2.0f          // slow down this far before the end of a row
+#define APPROACH_FREQ_HZ     400
+#define ROWEND_PAUSE_MS      1500          // pause at the end of a row (stands in for the turn / row change)
+
+/* Zone risk scoring */
+#define W_DISEASE            3             // blight or fungal finding
+#define W_NUTRIENT           2
+#define RISK_AMBER           2
+#define RISK_RED             5
 #define LOOP_MS              30
 #define RAMP_STEP_HZ         40
 #define TELEMETRY_LOOPS      67            // ~2 s
@@ -90,7 +107,8 @@
 #define IMU_FAIL_LIMIT       3             // consecutive failed reads before IMU is declared faulty
 #define SAFETY_REQUIRE_IMU   1             // 1 = no IMU reading means no laser (fail-safe)
 #define IMU_ZERO_MEANS_LEVEL 1             // SIMULATION ONLY: 1 = treat an all-zero accel reading (Wokwi default sliders) as level, 0 deg. Set to 0 on real hardware.
-#define TELEMETRY_BUF        640
+#define TELEMETRY_BUF        896
+#define ZONES_JSON_BUF      2560
 
 static const char *TAG = "ROVER";
 
@@ -113,6 +131,7 @@ typedef struct {
     uint8_t    confidence;      // 0-100 %
     int16_t    offset_mm;       // horizontal offset of target from camera centre (-100..100)
     int32_t    position_steps;  // rover position when it was seen
+    uint8_t    row;             // row the rover was in
 } detection_t;
 
 static QueueHandle_t det_queue;
@@ -130,11 +149,13 @@ typedef enum {
     ST_INSPECT,
     ST_RESUME,
     ST_HOLD,
+    ST_ROWEND,
+    ST_DONE,
     ST_ESTOP,
 } rover_state_t;
 
 static const char *STATE_NAMES[] = {
-    "CRUISE", "DETECTED", "STOP", "ALIGN", "FIRE", "COOLDOWN", "INSPECT", "RESUME", "HOLD", "ESTOP"
+    "CRUISE", "DETECTED", "STOP", "ALIGN", "FIRE", "COOLDOWN", "INSPECT", "RESUME", "HOLD", "ROWEND", "DONE", "ESTOP"
 };
 
 /* ---------------- Shared state ---------------- */
@@ -152,6 +173,9 @@ static volatile uint32_t cnt_low_conf       = 0;
 static volatile uint32_t cnt_dropped        = 0;
 static volatile uint32_t cnt_blocked        = 0;   // weeds skipped because laser was unsafe
 
+static volatile uint8_t current_row = 0;
+static volatile uint32_t row_travel_steps = 0;   // steps driven in the current row
+
 static detection_t active_det;          // target currently being engaged
 static detection_t last_det;            // last accepted detection (for telemetry)
 static bool        have_last_det = false;
@@ -162,9 +186,118 @@ static volatile bool req_estop = false;
 static volatile bool req_reset = false;
 static volatile bool req_abort = false;
 static volatile bool req_status = false;
+static volatile bool req_start = false;
 
 static bool pwm_running = false;
 static uint32_t pwm_last_freq = 0;
+
+/* ================================================================
+ *  ZONES: rows x zones grid with per-zone health records
+ * ================================================================ */
+typedef struct {
+    uint16_t weeds_seen, weeds_zapped, weeds_blocked;
+    uint16_t healthy;
+    uint16_t blight, fungal, nutrient;
+    bool     visited;
+} zone_t;
+
+static zone_t zones[NUM_ROWS][ZONES_PER_ROW];
+
+static int zone_index_for(int32_t pos_steps) {
+    if (pos_steps < 0) return 0;
+    int z = (int)((float)pos_steps / STEPS_PER_METER / ZONE_LENGTH_M);
+    return z >= ZONES_PER_ROW ? ZONES_PER_ROW - 1 : z;
+}
+
+static int zone_score(const zone_t *z) {
+    int unresolved = (int)z->weeds_seen - (int)z->weeds_zapped;
+    if (unresolved < 0) unresolved = 0;
+    return W_DISEASE * (z->blight + z->fungal) + W_NUTRIENT * z->nutrient + unresolved + z->weeds_blocked;
+}
+
+/* '.' not scanned, G fine, A watch, R inspect in person */
+static char zone_risk_char(const zone_t *z) {
+    if (!z->visited) return '.';
+    int sc = zone_score(z);
+    if (sc >= RISK_RED) return 'R';
+    if (sc >= RISK_AMBER) return 'A';
+    return 'G';
+}
+
+static const char *zone_risk_name(const zone_t *z) {
+    switch (zone_risk_char(z)) {
+        case 'R': return "RED";
+        case 'A': return "AMBER";
+        case 'G': return "GREEN";
+        default:  return "UNSCANNED";
+    }
+}
+
+static zone_t *zone_for(const detection_t *d) {
+    uint8_t r = d->row < NUM_ROWS ? d->row : NUM_ROWS - 1;
+    return &zones[r][zone_index_for(d->position_steps)];
+}
+
+static void zones_clear(void) { memset(zones, 0, sizeof(zones)); }
+
+static void print_zone_report(void) {
+    printf("\n=== ZONE MAP  (G ok, A watch, R inspect, . not scanned) ===\n");
+    for (int r = 0; r < NUM_ROWS; r++) {
+        printf("  ROW %d: ", r + 1);
+        for (int z = 0; z < ZONES_PER_ROW; z++) printf("%c ", zone_risk_char(&zones[r][z]));
+        printf("\n");
+    }
+    printf("--- details ---\n");
+    bool any = false;
+    for (int r = 0; r < NUM_ROWS; r++) {
+        for (int z = 0; z < ZONES_PER_ROW; z++) {
+            const zone_t *q = &zones[r][z];
+            if (!q->visited) continue;
+            if (!(q->weeds_seen || q->healthy || q->blight || q->fungal || q->nutrient)) continue;
+            any = true;
+            printf("  R%d Z%d  weeds %u (zapped %u, blocked %u)  blight %u fungal %u nutrient %u  healthy %u  -> %s\n",
+                   r + 1, z + 1, q->weeds_seen, q->weeds_zapped, q->weeds_blocked,
+                   q->blight, q->fungal, q->nutrient, q->healthy, zone_risk_name(q));
+        }
+    }
+    if (!any) printf("  (no findings yet)\n");
+    printf("--- inspect in person ---\n");
+    bool insp = false;
+    for (int r = 0; r < NUM_ROWS; r++) {
+        for (int z = 0; z < ZONES_PER_ROW; z++) {
+            char c = zone_risk_char(&zones[r][z]);
+            if (c == 'A' || c == 'R') { printf("  R%d Z%d  %s\n", r + 1, z + 1, c == 'R' ? "RED - priority" : "AMBER - check"); insp = true; }
+        }
+    }
+    if (!insp) printf("  none\n");
+    printf("===========================================================\n");
+}
+
+static void build_zones_json(char *buf, size_t n) {
+    size_t o = (size_t)snprintf(buf, n,
+        "{\"rows\":%d,\"zones_per_row\":%d,\"zone_len_m\":%.1f,\"current_row\":%d,\"state\":\"%s\",\"zones\":[",
+        NUM_ROWS, ZONES_PER_ROW, (double)ZONE_LENGTH_M, current_row + 1, STATE_NAMES[rover_state]);
+    bool first = true;
+    for (int r = 0; r < NUM_ROWS; r++) {
+        for (int z = 0; z < ZONES_PER_ROW; z++) {
+            if (o >= n) return;
+            const zone_t *q = &zones[r][z];
+            o += (size_t)snprintf(buf + o, n - o,
+                "%s{\"r\":%d,\"z\":%d,\"seen\":%u,\"zapped\":%u,\"blocked\":%u,\"healthy\":%u,"
+                "\"blight\":%u,\"fungal\":%u,\"nutrient\":%u,\"risk\":\"%s\"}",
+                first ? "" : ",", r + 1, z + 1, q->weeds_seen, q->weeds_zapped, q->weeds_blocked, q->healthy,
+                q->blight, q->fungal, q->nutrient, zone_risk_name(q));
+            first = false;
+        }
+    }
+    if (o < n) snprintf(buf + o, n - o, "]}");
+}
+
+static bool row_end_reached(void) {
+    if (row_travel_steps < (uint32_t)(ROW_LENGTH_STEPS / 2)) return false;   // must have driven a good part of the row
+    if (current_dir) return rover_position_steps >= ROW_LENGTH_STEPS;
+    return rover_position_steps <= 0;
+}
 
 /* ---------------- Helpers ---------------- */
 static uint32_t now_ms(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
@@ -338,6 +471,7 @@ static bool inject_detection(det_type_t type, int conf, int offset_mm, const cha
         .confidence = (uint8_t)conf,
         .offset_mm = (int16_t)offset_mm,
         .position_steps = rover_position_steps,
+        .row = current_row,
     };
     if (xQueueSend(det_queue, &d, 0) != pdTRUE) {
         ESP_LOGW(TAG, "[%s] detection queue full, dropped", src);
@@ -356,20 +490,27 @@ static bool process_detection(const detection_t *d) {
     }
     last_det = *d;
     have_last_det = true;
+    zone_t *zn = zone_for(d);
+    zn->visited = true;
 
     switch (d->type) {
         case DET_HEALTHY:
             cnt_healthy++;
+            zn->healthy++;
             ESP_LOGI(TAG, "Healthy leaf logged, continuing.");
             return false;
         case DET_WEED:
             cnt_weeds_detected++;
+            zn->weeds_seen++;
             active_det = *d;
             return true;
         case DET_BLIGHT:
         case DET_FUNGAL:
         case DET_NUTRIENT:
             cnt_diseases++;
+            if (d->type == DET_BLIGHT) zn->blight++;
+            else if (d->type == DET_FUNGAL) zn->fungal++;
+            else zn->nutrient++;
             active_det = *d;
             return true;
         default:
@@ -390,15 +531,23 @@ static void build_telemetry(char *buf, size_t n) {
     float pos_m  = (float)rover_position_steps / STEPS_PER_METER;
     float odo_m  = (float)total_steps_traveled / STEPS_PER_METER;
     const char *ld = have_last_det ? DET_NAMES[last_det.type] : "NONE";
+    char map[NUM_ROWS * (ZONES_PER_ROW + 1) + 1];
+    int mi = 0;
+    for (int r = 0; r < NUM_ROWS; r++) {
+        for (int z = 0; z < ZONES_PER_ROW; z++) map[mi++] = zone_risk_char(&zones[r][z]);
+        if (r < NUM_ROWS - 1) map[mi++] = '|';
+    }
+    map[mi] = 0;
     snprintf(buf, n,
         "{\"status\":\"online\",\"state\":\"%s\",\"dir\":\"%s\",\"freq_hz\":%lu,"
         "\"position_m\":%.2f,\"odometer_m\":%.2f,"
         "\"weeds_detected\":%lu,\"weeds_zapped\":%lu,\"diseases\":%lu,\"healthy\":%lu,"
-        "\"low_conf\":%lu,\"dropped\":%lu,\"blocked\":%lu,\"person\":%d,\"tilt_deg\":%.1f,\"safety\":\"%s\",\"last_det\":\"%s\"}",
+        "\"row\":%d,\"zone\":%d,\"map\":\"%s\",\"low_conf\":%lu,\"dropped\":%lu,\"blocked\":%lu,\"person\":%d,\"tilt_deg\":%.1f,\"safety\":\"%s\",\"last_det\":\"%s\"}",
         STATE_NAMES[rover_state], current_dir ? "FWD" : "REV", (unsigned long)current_freq,
         pos_m, odo_m,
         (unsigned long)cnt_weeds_detected, (unsigned long)cnt_weeds_zapped,
         (unsigned long)cnt_diseases, (unsigned long)cnt_healthy,
+        current_row + 1, zone_index_for(rover_position_steps) + 1, map,
         (unsigned long)cnt_low_conf, (unsigned long)cnt_dropped, (unsigned long)cnt_blocked,
         person_present ? 1 : 0, (double)tilt_deg, SAFETY_NAMES[safety_reason()], ld);
 }
@@ -417,6 +566,9 @@ static void print_help(void) {
     printf(" estop / reset                 emergency stop / clear it\n");
     printf(" status                        print telemetry now\n");
     printf(" safety                        explain why the laser is allowed/blocked\n");
+    printf(" zones                         print the zone map and inspection list\n");
+    printf(" zonesjson                     zone data as JSON (for the dashboard)\n");
+    printf(" start                         (re)start a mission: clears the zone records\n");
     printf(" (conf default 90, offset default random -60..60)\n");
     printf("--------------------------------------------------------\n");
 }
@@ -442,6 +594,12 @@ static void handle_command(char *line) {
     else if (!strcmp(cmd, "estop"))    req_estop = true;
     else if (!strcmp(cmd, "reset"))    req_reset = true;
     else if (!strcmp(cmd, "status"))   req_status = true;
+    else if (!strcmp(cmd, "zones"))    print_zone_report();
+    else if (!strcmp(cmd, "zonesjson")) {
+        char *zb = malloc(ZONES_JSON_BUF);
+        if (zb) { build_zones_json(zb, ZONES_JSON_BUF); printf("ZONES: %s\n", zb); free(zb); }
+    }
+    else if (!strcmp(cmd, "start"))    req_start = true;
     else if (!strcmp(cmd, "safety")) {
         printf("SAFETY DIAG\n");
         printf("  verdict     : %s\n", SAFETY_NAMES[safety_reason()]);
@@ -524,13 +682,25 @@ static esp_err_t telemetry_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t zones_get_handler(httpd_req_t *req) {
+    char *resp = malloc(ZONES_JSON_BUF);
+    if (!resp) return ESP_FAIL;
+    build_zones_json(resp, ZONES_JSON_BUF);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    free(resp);
+    return ESP_OK;
+}
+
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t uri = { .uri = "/telemetry", .method = HTTP_GET, .handler = telemetry_get_handler, .user_ctx = NULL };
         httpd_register_uri_handler(server, &uri);
-        ESP_LOGI(TAG, "HTTP: /telemetry registered");
+        httpd_uri_t zuri = { .uri = "/zones", .method = HTTP_GET, .handler = zones_get_handler, .user_ctx = NULL };
+        httpd_register_uri_handler(server, &zuri);
+        ESP_LOGI(TAG, "HTTP: /telemetry and /zones registered");
     }
     return server;
 }
@@ -569,7 +739,7 @@ static void render_display(void) {
     /* Page 0 is partly hidden by the bezel, so the layout uses pages 2-14. Max 16 chars per line. */
     oled_line(2, "%s %s", STATE_NAMES[rover_state],
               rover_state == ST_HOLD ? SAFETY_NAMES[safety_reason()] : (current_dir ? "FWD" : "REV"));
-    oled_line(4, "SPEED %lu HZ", (unsigned long)current_freq);
+    oled_line(4, "R%d/%d Z%d/%d %luHZ", current_row + 1, NUM_ROWS, zone_index_for(rover_position_steps) + 1, ZONES_PER_ROW, (unsigned long)current_freq);
     oled_line(6, "POS %.2f M", (float)rover_position_steps / STEPS_PER_METER);
     oled_line(8, "DIST %.1f M", (float)total_steps_traveled / STEPS_PER_METER);
 
@@ -580,6 +750,12 @@ static void render_display(void) {
             break;
         case ST_ESTOP:
             oled_line(10, "TYPE RESET");
+            break;
+        case ST_ROWEND:
+            oled_line(10, "END OF ROW");
+            break;
+        case ST_DONE:
+            oled_line(10, "MISSION DONE");
             break;
         default:
             if (have_last_det) oled_line(10, "LAST %s %d%%", OLED_NAMES[last_det.type], last_det.confidence);
@@ -726,8 +902,26 @@ void app_main(void) {
         }
         if (req_abort) {
             req_abort = false;
-            if (rover_state != ST_CRUISE && rover_state != ST_RESUME && rover_state != ST_ESTOP) {
+            if (rover_state != ST_CRUISE && rover_state != ST_RESUME && rover_state != ST_ESTOP &&
+                rover_state != ST_ROWEND && rover_state != ST_DONE) {
                 ESP_LOGW(TAG, "Engagement aborted by operator.");
+                enter_state(ST_RESUME);
+            }
+        }
+
+        if (req_start) {
+            req_start = false;
+            if (rover_state == ST_ESTOP) {
+                ESP_LOGW(TAG, "start ignored: clear the e-stop first (reset).");
+            } else {
+                zones_clear();
+                cnt_weeds_detected = cnt_weeds_zapped = cnt_diseases = cnt_healthy = 0;
+                cnt_low_conf = cnt_dropped = cnt_blocked = 0;
+                current_row = 0;
+                row_travel_steps = 0;
+                rover_position_steps = 0;
+                target_dir = 1;
+                ESP_LOGI(TAG, "MISSION START: %d rows x %d zones (%.0f m rows). Records cleared.", NUM_ROWS, ZONES_PER_ROW, (double)ROW_LENGTH_M);
                 enter_state(ST_RESUME);
             }
         }
@@ -736,6 +930,7 @@ void app_main(void) {
         detection_t d;
         switch (rover_state) {
             case ST_CRUISE:
+                if (row_end_reached()) { enter_state(ST_ROWEND); break; }
                 if (xQueueReceive(det_queue, &d, 0) == pdTRUE) {
                     if (process_detection(&d)) {
                         ESP_LOGI(TAG, "TARGET LOCKED: %s %d%% offset %d mm at %.2f m",
@@ -782,6 +977,7 @@ void app_main(void) {
                 }
                 if (state_elapsed_ms() >= FIRE_MS) {
                     cnt_weeds_zapped++;
+                    zone_for(&active_det)->weeds_zapped++;
                     ESP_LOGI(TAG, "LASER OFF. Weed destroyed (total %lu).", (unsigned long)cnt_weeds_zapped);
                     enter_state(ST_COOLDOWN);
                 }
@@ -809,6 +1005,7 @@ void app_main(void) {
                     enter_state(ST_ALIGN);
                 } else if (state_elapsed_ms() >= HOLD_TIMEOUT_MS) {
                     cnt_blocked++;
+                    zone_for(&active_det)->weeds_blocked++;
                     ESP_LOGW(TAG, "Weed SKIPPED (unsafe too long: %s). Blocked total %lu.",
                              SAFETY_NAMES[safety_reason()], (unsigned long)cnt_blocked);
                     enter_state(ST_RESUME);
@@ -816,8 +1013,31 @@ void app_main(void) {
                 break;
 
             case ST_RESUME:
+                if (row_end_reached()) { enter_state(ST_ROWEND); break; }
                 drain_queue_dropped("holdoff");
                 if (state_elapsed_ms() >= RESUME_HOLDOFF_MS) enter_state(ST_CRUISE);
+                break;
+
+            case ST_ROWEND:
+                drain_queue_dropped("row end");
+                if (current_freq == 0 && state_elapsed_ms() >= ROWEND_PAUSE_MS) {
+                    ESP_LOGI(TAG, "ROW %d COMPLETE (%.1f m driven).", current_row + 1, (double)row_travel_steps / STEPS_PER_METER);
+                    if (current_row + 1 < NUM_ROWS) {
+                        current_row++;
+                        row_travel_steps = 0;
+                        target_dir = !current_dir;           // serpentine: drive back along the next row
+                        ESP_LOGI(TAG, "Starting row %d, heading %s.", current_row + 1, target_dir ? "FWD" : "REV");
+                        enter_state(ST_RESUME);
+                    } else {
+                        ESP_LOGI(TAG, "MISSION COMPLETE.");
+                        print_zone_report();
+                        enter_state(ST_DONE);
+                    }
+                }
+                break;
+
+            case ST_DONE:
+                drain_queue_dropped("mission done");
                 break;
 
             case ST_ESTOP:
@@ -828,6 +1048,11 @@ void app_main(void) {
         /* ---------- Motor control ---------- */
         bool drive = (rover_state == ST_CRUISE || rover_state == ST_RESUME);
         uint32_t target_freq = drive ? pot_freq : 0;
+        if (drive) {                                          // slow down near the end of the row
+            int32_t to_end = current_dir ? (ROW_LENGTH_STEPS - rover_position_steps) : rover_position_steps;
+            if (to_end < (int32_t)(APPROACH_ZONE_M * STEPS_PER_METER) && target_freq > APPROACH_FREQ_HZ)
+                target_freq = APPROACH_FREQ_HZ;
+        }
         if (current_dir != target_dir) target_freq = 0;      // stop before reversing
 
         if (current_freq < target_freq) {
@@ -852,9 +1077,14 @@ void app_main(void) {
             uint32_t steps = step_accum / 1000;
             step_accum %= 1000;
             total_steps_traveled += steps;
+            row_travel_steps += steps;
             if (current_dir) rover_position_steps += (int32_t)steps;
             else             rover_position_steps -= (int32_t)steps;
         }
+
+        /* ---------- Mark the zone the rover is in as scanned ---------- */
+        if (rover_state != ST_DONE && rover_state != ST_ESTOP)
+            zones[current_row][zone_index_for(rover_position_steps)].visited = true;
 
         /* ---------- Hard laser interlock: on only in FIRE and only when safe ---------- */
         gpio_set_level(LASER_LED_PIN, (rover_state == ST_FIRE && safety_reason() == SAFE_OK) ? 1 : 0);
