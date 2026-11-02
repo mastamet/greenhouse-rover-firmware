@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Greenhouse Rover Dashboard</title>
+<style>
+:root{--bg:#f4f6f3;--card:#fff;--ink:#1d2a22;--mute:#66756b;--line:#dde4dd;--g:#2e9e5b;--a:#e0a526;--r:#d64545;--u:#c9d0ca;--on:#fff;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121815;--card:#1b241f;--ink:#e6efe8;--mute:#93a398;--line:#2b3830;--u:#35423a}}
+:root[data-theme="dark"]{--bg:#121815;--card:#1b241f;--ink:#e6efe8;--mute:#93a398;--line:#2b3830;--u:#35423a}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:980px;margin:0 auto;padding:16px}
+header{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;justify-content:space-between;margin-bottom:14px}
+h1{font-size:20px;margin:0}
+h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:0 0 10px}
+.pills{display:flex;gap:6px;flex-wrap:wrap}
+.pill{padding:3px 10px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-size:12px;font-weight:600}
+.pill.ok{color:var(--g)}.pill.bad{color:var(--r)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.kpi b{display:block;font-size:24px}.kpi span{font-size:12px;color:var(--mute)}
+.grid{display:grid;gap:8px}
+.row{display:grid;gap:8px;align-items:stretch}
+.rl{font-size:12px;color:var(--mute);margin:2px 0 -2px}
+.cell{border-radius:10px;padding:8px;color:var(--on);min-height:78px;position:relative;font-size:12px}
+.cell.G{background:var(--g)}.cell.A{background:var(--a);color:#241a00}.cell.R{background:var(--r)}.cell.U{background:var(--u);color:var(--mute)}
+.cell strong{display:block;font-size:13px}
+.cell.here{outline:3px solid var(--ink);outline-offset:2px}
+.cell .tag{position:absolute;top:6px;right:8px;font-size:10px;font-weight:700}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;color:var(--mute);margin-top:10px}
+.legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+ol{margin:0;padding-left:20px}li{margin:6px 0}
+.badge{font-size:11px;font-weight:700;padding:1px 7px;border-radius:99px;color:#fff;margin-left:6px}
+.badge.R{background:var(--r)}.badge.A{background:var(--a);color:#241a00}
+textarea{width:100%;min-height:90px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);padding:8px;font:12px ui-monospace,Menlo,Consolas,monospace}
+button{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer;margin:8px 6px 0 0}
+button.p{background:var(--g);border-color:var(--g);color:#fff}
+.note{font-size:12px;color:var(--mute);margin:6px 0 0}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>🌱 Greenhouse Rover Dashboard</h1>
+  <div class="pills"><span class="pill" id="pState">No data</span><span class="pill" id="pSafe">Safety –</span><span class="pill" id="pTime">Never updated</span></div>
+</header>
+
+<div class="kpis" id="kpis"></div>
+
+<div class="card"><h2>Zone health map</h2><div class="grid" id="map"></div>
+  <div class="legend"><span><i style="background:var(--g)"></i>Healthy</span><span><i style="background:var(--a)"></i>Watch</span><span><i style="background:var(--r)"></i>Inspect in person</span><span><i style="background:var(--u)"></i>Not scanned</span><span>Outlined = rover is here</span></div>
+</div>
+
+<div class="card"><h2>Inspect in person</h2><div id="insp"></div></div>
+
+<div class="card"><h2>Load rover data</h2>
+  <textarea id="inp" placeholder="In the Wokwi serial monitor type  zonesjson  (and  status ), copy the lines, and paste them here."></textarea>
+  <button class="p" id="load">Update dashboard</button><button id="demo">Load demo data</button><button id="clear">Clear</button>
+  <p class="note">This page can’t connect to the simulator directly, so it reads what you paste. The <code>ZONES:</code> line gives the full map; <code>TELEMETRY:</code> or <code>STATUS:</code> lines add the live rover state.</p>
+</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let Z = null, T = null, stamp = null;
+
+function extract(text) {
+  const out = []; let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') { if (depth > 0) inStr = true; continue; }
+    if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}' && depth > 0 && --depth === 0) {
+      try { out.push(JSON.parse(text.slice(start, i + 1).replace(/\s*[\r\n]+\s*/g, ''))); } catch (e) {}
+    }
+  }
+  return out;
+}
+
+function ingest(text) {
+  let got = 0;
+  for (const o of extract(text)) {
+    if (Array.isArray(o.zones)) { Z = o; got++; }
+    else if (o.state && (o.map || o.status)) { T = o; got++; }
+  }
+  if (got) { stamp = new Date(); try { localStorage.setItem('rover-dash', JSON.stringify({ Z, T, stamp })); } catch (e) {} }
+  render();
+  return got;
+}
+
+const score = z => 3 * (z.blight + z.fungal) + 2 * z.nutrient + Math.max(0, z.seen - z.zapped) + z.blocked;
+
+function zonesFromMap(map) {
+  const rows = map.split('|'), zs = [];
+  const risk = { G: 'GREEN', A: 'AMBER', R: 'RED', '.': 'UNSCANNED' };
+  rows.forEach((r, i) => [...r].forEach((c, j) => zs.push({ r: i + 1, z: j + 1, seen: 0, zapped: 0, blocked: 0, healthy: 0, blight: 0, fungal: 0, nutrient: 0, risk: risk[c] || 'UNSCANNED', mapOnly: true })));
+  return { rows: rows.length, zones_per_row: rows[0].length, zones: zs };
+}
+
+function render() {
+  const src = Z || (T && T.map ? zonesFromMap(T.map) : null);
+  $('pState').textContent = T ? 'State: ' + T.state : (Z ? 'State: ' + Z.state : 'No data');
+  const safe = T ? T.safety : null;
+  $('pSafe').textContent = 'Safety: ' + (safe || '–');
+  $('pSafe').className = 'pill ' + (safe ? (safe === 'OK' ? 'ok' : 'bad') : '');
+  $('pTime').textContent = stamp ? 'Updated ' + new Date(stamp).toLocaleTimeString() : 'Never updated';
+
+  const zs = src ? src.zones : [];
+  const sum = k => zs.reduce((a, z) => a + (z[k] || 0), 0);
+  const nR = zs.filter(z => z.risk === 'RED').length, nA = zs.filter(z => z.risk === 'AMBER').length;
+  const k = [
+    ['Weeds seen', T ? T.weeds_detected : sum('seen')], ['Weeds destroyed', T ? T.weeds_zapped : sum('zapped')],
+    ['Shots blocked', T ? T.blocked : sum('blocked')], ['Disease findings', T ? T.diseases : sum('blight') + sum('fungal') + sum('nutrient')],
+    ['Red zones', nR], ['Amber zones', nA]
+  ];
+  $('kpis').innerHTML = k.map(([l, v]) => `<div class="kpi"><b>${v ?? 0}</b><span>${l}</span></div>`).join('');
+
+  const map = $('map'); map.innerHTML = '';
+  if (!src) { map.innerHTML = '<p class="note">No zone data yet. Paste the rover’s output below, or load the demo.</p>'; $('insp').innerHTML = '<p class="note">Nothing to inspect yet.</p>'; return; }
+  const cols = src.zones_per_row, here = T ? [T.row, T.zone] : null;
+  for (let r = 1; r <= src.rows; r++) {
+    const lab = document.createElement('div'); lab.className = 'rl'; lab.textContent = 'Row ' + r; map.appendChild(lab);
+    const row = document.createElement('div'); row.className = 'row'; row.style.gridTemplateColumns = `repeat(${cols},1fr)`;
+    zs.filter(z => z.r === r).forEach(z => {
+      const c = { RED: 'R', AMBER: 'A', GREEN: 'G' }[z.risk] || 'U';
+      const d = document.createElement('div'); d.className = 'cell ' + c + (here && here[0] === z.r && here[1] === z.z ? ' here' : '');
+      const bits = z.mapOnly ? '' : (z.seen ? `Weeds ${z.zapped}/${z.seen}` + (z.blocked ? ` (${z.blocked} missed)` : '') + '<br>' : '') +
+        (z.blight + z.fungal + z.nutrient ? `Disease ${z.blight + z.fungal + z.nutrient}` : (z.healthy ? `Healthy ${z.healthy}` : ''));
+      d.innerHTML = `<strong>Zone ${z.z}</strong>${c === 'U' ? 'Not scanned' : bits || 'Clear'}` + (c === 'R' ? '<span class="tag">INSPECT</span>' : '');
+      row.appendChild(d);
+    });
+    map.appendChild(row);
+  }
+  const list = zs.filter(z => z.risk === 'RED' || z.risk === 'AMBER').sort((a, b) => (b.risk === 'RED') - (a.risk === 'RED') || score(b) - score(a));
+  $('insp').innerHTML = list.length ? '<ol>' + list.map(z => {
+    const why = [];
+    if (z.blight) why.push(z.blight + ' blight'); if (z.fungal) why.push(z.fungal + ' fungal'); if (z.nutrient) why.push(z.nutrient + ' nutrient deficiency');
+    if (z.blocked) why.push(z.blocked + ' weed(s) not destroyed');
+    const t = z.risk === 'RED' ? 'R' : 'A';
+    return `<li><strong>Row ${z.r}, Zone ${z.z}</strong><span class="badge ${t}">${z.risk === 'RED' ? 'Priority' : 'Check'}</span><br><span class="note">${why.join(', ') || 'Flagged by the rover'}</span></li>`;
+  }).join('') + '</ol>' : '<p class="note">No zones need a visit. All scanned zones look healthy.</p>';
+}
+
+function demo() {
+  const z = [], f = (r, zz, o) => z.push(Object.assign({ r, z: zz, seen: 0, zapped: 0, blocked: 0, healthy: 0, blight: 0, fungal: 0, nutrient: 0, risk: 'GREEN' }, o));
+  f(1,1,{healthy:3}); f(1,2,{seen:2,zapped:2,healthy:1}); f(1,3,{blight:1,healthy:1,risk:'AMBER'}); f(1,4,{seen:1,zapped:0,blocked:1,risk:'AMBER'}); f(1,5,{healthy:2});
+  f(2,1,{healthy:1}); f(2,2,{blight:2,fungal:1,risk:'RED'}); f(2,3,{nutrient:1,risk:'AMBER'}); f(2,4,{seen:1,zapped:1}); f(2,5,{healthy:2});
+  f(3,1,{risk:'UNSCANNED'}); f(3,2,{risk:'UNSCANNED'}); f(3,3,{risk:'UNSCANNED'}); f(3,4,{risk:'UNSCANNED'}); f(3,5,{risk:'UNSCANNED'});
+  Z = { rows: 3, zones_per_row: 5, zone_len_m: 2, state: 'CRUISE', zones: z };
+  T = { state: 'CRUISE', safety: 'OK', row: 3, zone: 1, weeds_detected: 4, weeds_zapped: 3, blocked: 1, diseases: 5 };
+  stamp = new Date(); render();
+}
+
+$('load').onclick = () => { if (!ingest($('inp').value)) alert('No rover data found. Paste the ZONES: or TELEMETRY: lines from the serial monitor.'); };
+$('demo').onclick = demo;
+$('clear').onclick = () => { Z = T = stamp = null; $('inp').value = ''; try { localStorage.removeItem('rover-dash'); } catch (e) {} render(); };
+try { const s = JSON.parse(localStorage.getItem('rover-dash') || 'null'); if (s) { Z = s.Z; T = s.T; stamp = s.stamp; } } catch (e) {}
+render();
+</script>
+</body>
+</html>
