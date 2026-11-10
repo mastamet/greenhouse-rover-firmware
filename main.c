@@ -7,6 +7,8 @@
  *   Also:   signed odometry, fractional step counting, PWM actually stops at 0 Hz
  *   Safety: PIR person detection + MPU6050 tilt cutoff gate the laser (SAFETY HOLD state)
  *   Zones:  rows x zones grid, auto end-of-row turn, per-zone health records + risk map
+ *   Battery: monitor on GPIO 34, low-battery return to base, docked charging, return to work
+ *   Turret: pan servo (GPIO 13) aims at the weed, arming switch (GPIO 14), drive-to-target approach
  */
 #include <stdio.h>
 #include <string.h>
@@ -41,6 +43,9 @@
 #define ALERT_LED_PIN        GPIO_NUM_27   // Yellow LED : on while engaging a target
 #define POT_ADC_CHANNEL      ADC_CHANNEL_7 // Potentiometer on GPIO 35
 #define PIR_PIN              GPIO_NUM_26   // PIR motion sensor (person nearby)
+#define BATT_ADC_CHANNEL     ADC_CHANNEL_6 // Battery sense on GPIO 34
+#define SERVO_PIN            GPIO_NUM_13   // Pan servo signal
+#define ARM_PIN              GPIO_NUM_14   // Arming slide switch (high = armed)
 
 /* ---------------- PWM (step pulses) ---------------- */
 #define LEDC_TIMER           LEDC_TIMER_0
@@ -107,7 +112,30 @@
 #define IMU_FAIL_LIMIT       3             // consecutive failed reads before IMU is declared faulty
 #define SAFETY_REQUIRE_IMU   1             // 1 = no IMU reading means no laser (fail-safe)
 #define IMU_ZERO_MEANS_LEVEL 1             // SIMULATION ONLY: 1 = treat an all-zero accel reading (Wokwi default sliders) as level, 0 deg. Set to 0 on real hardware.
-#define TELEMETRY_BUF        896
+#define TELEMETRY_BUF        1100
+
+/* Turret */
+#define SERVO_TIMER          LEDC_TIMER_1
+#define SERVO_CHANNEL        LEDC_CHANNEL_1
+#define SERVO_CENTRE_DEG     90.0f
+#define SERVO_SLEW_DEG       2.0f          // degrees moved per 30 ms loop, so the sweep is visible
+#define LASER_HEIGHT_MM      250.0f        // laser height above the ground
+#define PAN_LIMIT_DEG        30.0f         // turret reach either side of centre
+#define ALIGN_SETTLE_MS      300           // settle time after the servo arrives
+#define APPROACH_FREQ_HZ_MAX 400
+
+/* Battery (3S Li-ion pack, 9.6 V empty .. 12.6 V full) */
+#define BATT_SIM_MAP         1             // 1 = simulation: pot position maps straight onto EMPTY..FULL. 0 = real divider.
+#define BATT_EMPTY_V         9.6f
+#define BATT_FULL_V          12.6f
+#define BATT_DIVIDER_RATIO   4.0f          // real hardware: pack voltage / ADC voltage
+#define BATT_ADC_FULLSCALE_V 3.3f
+#define BATT_LOW_PCT         30            // warning only
+#define BATT_RTB_PCT         20            // go back to base
+#define BATT_LASER_MIN_PCT   10            // laser inhibited at or below this
+#define BATT_RESUME_PCT      80            // leave the dock once charged to this
+#define DOCK_MIN_MS          3000
+#define TRANSIT_FREQ_HZ      800
 #define ZONES_JSON_BUF      2560
 
 static const char *TAG = "ROVER";
@@ -129,8 +157,10 @@ static const char *DET_NAMES[] = { "NONE", "HEALTHY", "WEED", "BLIGHT", "FUNGAL"
 typedef struct {
     det_type_t type;
     uint8_t    confidence;      // 0-100 %
-    int16_t    offset_mm;       // horizontal offset of target from camera centre (-100..100)
-    int32_t    position_steps;  // rover position when it was seen
+    int16_t    offset_mm;       // sideways offset of target from the laser line (-200..200)
+    int16_t    forward_mm;      // how far ahead of the rover the target is
+    int32_t    position_steps;  // position of the TARGET along the row (sighting + forward distance)
+    uint8_t    dir;             // heading when seen (1 = FWD)
     uint8_t    row;             // row the rover was in
 } detection_t;
 
@@ -143,6 +173,7 @@ typedef enum {
     ST_CRUISE = 0,
     ST_DETECTED,
     ST_STOP,
+    ST_APPROACH,
     ST_ALIGN,
     ST_FIRE,
     ST_COOLDOWN,
@@ -151,11 +182,14 @@ typedef enum {
     ST_HOLD,
     ST_ROWEND,
     ST_DONE,
+    ST_RTB,
+    ST_DOCKED,
+    ST_RETURN,
     ST_ESTOP,
 } rover_state_t;
 
 static const char *STATE_NAMES[] = {
-    "CRUISE", "DETECTED", "STOP", "ALIGN", "FIRE", "COOLDOWN", "INSPECT", "RESUME", "HOLD", "ROWEND", "DONE", "ESTOP"
+    "CRUISE", "DETECTED", "STOP", "APPROACH", "ALIGN", "FIRE", "COOLDOWN", "INSPECT", "RESUME", "HOLD", "ROWEND", "DONE", "RTB", "DOCKED", "RETURN", "ESTOP"
 };
 
 /* ---------------- Shared state ---------------- */
@@ -187,6 +221,20 @@ static volatile bool req_reset = false;
 static volatile bool req_abort = false;
 static volatile bool req_status = false;
 static volatile bool req_start = false;
+static volatile bool req_home = false;
+
+static volatile bool  armed = false;
+static volatile float pan_cmd = SERVO_CENTRE_DEG;   // commanded servo angle
+static volatile float pan_cur = SERVO_CENTRE_DEG;   // where the servo currently is (slewed)
+static volatile float pan_aim_deg = 0.0f;           // aim angle relative to centre, for display
+static bool  aim_reachable = true;
+static int32_t approach_goal = 0;
+
+static volatile float batt_v = 12.0f;
+static volatile int   batt_pct = 100;
+static uint8_t saved_row = 0;            // where to pick the mission back up after charging
+static int32_t saved_pos = 0;
+static int     saved_dir = 1;
 
 static bool pwm_running = false;
 static uint32_t pwm_last_freq = 0;
@@ -299,6 +347,53 @@ static bool row_end_reached(void) {
     return rover_position_steps <= 0;
 }
 
+static void battery_update(adc_oneshot_unit_handle_t h, bool prime) {
+    int raw = 0;
+    if (adc_oneshot_read(h, BATT_ADC_CHANNEL, &raw) != ESP_OK) return;
+    float frac = (float)raw / 4095.0f;
+    float v = BATT_SIM_MAP ? BATT_EMPTY_V + frac * (BATT_FULL_V - BATT_EMPTY_V)
+                           : frac * BATT_ADC_FULLSCALE_V * BATT_DIVIDER_RATIO;
+    batt_v = prime ? v : batt_v + 0.1f * (v - batt_v);            // smooth out jitter
+    int pct = (int)((batt_v - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0f + 0.5f);
+    batt_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+
+    static bool low = false;
+    if (!low && batt_pct <= BATT_LOW_PCT) { low = true;  ESP_LOGW(TAG, "BATTERY LOW: %d%% (%.2f V)", batt_pct, (double)batt_v); }
+    if (low && batt_pct > BATT_LOW_PCT + 5) { low = false; ESP_LOGI(TAG, "Battery recovered: %d%%", batt_pct); }
+}
+
+static const char *battery_level_name(void) {
+    if (batt_pct <= BATT_LASER_MIN_PCT) return "CRITICAL";
+    if (batt_pct <= BATT_RTB_PCT)       return "RETURN";
+    if (batt_pct <= BATT_LOW_PCT)       return "LOW";
+    return "OK";
+}
+
+/* True when the rover has reached (or just passed) a transit goal */
+static bool transit_arrived(int32_t goal, int want_fwd) {
+    int32_t diff = goal - rover_position_steps;
+    if (diff < 0) diff = -diff;
+    if (diff <= 12) return true;
+    return want_fwd ? rover_position_steps >= goal : rover_position_steps <= goal;
+}
+
+static void servo_write_deg(float deg) {
+    if (deg < 0) deg = 0;
+    if (deg > 180) deg = 180;
+    float us = 500.0f + deg / 180.0f * 2000.0f;                 // 0.5 - 2.5 ms pulse
+    uint32_t duty = (uint32_t)(us / 20000.0f * 16384.0f);       // 14-bit, 50 Hz
+    ledc_set_duty(LEDC_MODE, SERVO_CHANNEL, duty);
+    ledc_update_duty(LEDC_MODE, SERVO_CHANNEL);
+}
+
+/* Called every loop: moves the servo gradually toward the commanded angle */
+static void servo_slew(void) {
+    float diff = pan_cmd - pan_cur;
+    if (diff > SERVO_SLEW_DEG) diff = SERVO_SLEW_DEG;
+    if (diff < -SERVO_SLEW_DEG) diff = -SERVO_SLEW_DEG;
+    if (diff != 0.0f) { pan_cur = pan_cur + diff; servo_write_deg(pan_cur); }
+}
+
 /* ---------------- Helpers ---------------- */
 static uint32_t now_ms(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
 
@@ -308,8 +403,18 @@ static void enter_state(rover_state_t s) {
 
     gpio_set_level(LASER_LED_PIN, s == ST_FIRE ? 1 : 0);
     bool engaged = (s == ST_DETECTED || s == ST_STOP || s == ST_ALIGN || s == ST_FIRE ||
-                    s == ST_COOLDOWN || s == ST_INSPECT || s == ST_HOLD || s == ST_ESTOP);
+                    s == ST_COOLDOWN || s == ST_INSPECT || s == ST_HOLD || s == ST_APPROACH || s == ST_ESTOP);
     gpio_set_level(ALERT_LED_PIN, engaged ? 1 : 0);
+
+    if (s == ST_ALIGN) {                                   // swing the turret toward the weed
+        float deg = atan2f((float)active_det.offset_mm, LASER_HEIGHT_MM) * 57.29578f;
+        pan_aim_deg = deg;
+        aim_reachable = fabsf(deg) <= PAN_LIMIT_DEG;
+        pan_cmd = SERVO_CENTRE_DEG + (aim_reachable ? deg : 0.0f);
+    } else if (s != ST_FIRE && s != ST_HOLD) {
+        pan_cmd = SERVO_CENTRE_DEG;                        // centre the turret in every other state
+        pan_aim_deg = 0.0f;
+    }
 
     ESP_LOGI(TAG, ">> STATE: %s  (pos=%.2f m)", STATE_NAMES[s],
              (float)rover_position_steps / STEPS_PER_METER);
@@ -340,8 +445,8 @@ static void motor_set_freq(uint32_t f) {
 /* ================================================================
  *  SAFETY: person detection (PIR) + tilt (MPU6050)
  * ================================================================ */
-typedef enum { SAFE_OK = 0, SAFE_PERSON, SAFE_TILT, SAFE_IMU } safety_t;
-static const char *SAFETY_NAMES[] = { "OK", "PERSON", "TILT", "IMU_FAULT" };
+typedef enum { SAFE_OK = 0, SAFE_PERSON, SAFE_TILT, SAFE_IMU, SAFE_BATTERY, SAFE_DISARMED } safety_t;
+static const char *SAFETY_NAMES[] = { "OK", "PERSON", "TILT", "IMU_FAULT", "BATTERY", "DISARMED" };
 
 static volatile bool  person_present = false;
 static volatile bool  tilt_blocked = false;
@@ -373,8 +478,10 @@ static void i2c_scan(i2c_port_t port, const char *name) {
 
 static safety_t safety_reason(void) {
     if (person_present) return SAFE_PERSON;
+    if (!armed) return SAFE_DISARMED;
     if (SAFETY_REQUIRE_IMU && !imu_ok) return SAFE_IMU;
     if (tilt_blocked) return SAFE_TILT;
+    if (batt_pct <= BATT_LASER_MIN_PCT) return SAFE_BATTERY;
     return SAFE_OK;
 }
 
@@ -426,6 +533,8 @@ static imu_read_t imu_read_tilt(float *deg) {
 static void safety_update(void) {
     uint32_t t = now_ms();
 
+    armed = gpio_get_level(ARM_PIN) != 0;
+
     /* Person detection (PIR output stays high a while after motion; we add a further clear delay) */
     int pir = gpio_get_level(PIR_PIN);
     if (pir) { last_person_ms = t; person_ever = true; }
@@ -465,19 +574,22 @@ static void safety_update(void) {
 }
 
 /* ---------------- Detection injection ---------------- */
-static bool inject_detection(det_type_t type, int conf, int offset_mm, const char *src) {
+static bool inject_detection(det_type_t type, int conf, int offset_mm, int forward_mm, const char *src) {
+    int32_t fwd_steps = (int32_t)((float)forward_mm * STEPS_PER_METER / 1000.0f);
     detection_t d = {
         .type = type,
         .confidence = (uint8_t)conf,
         .offset_mm = (int16_t)offset_mm,
-        .position_steps = rover_position_steps,
+        .forward_mm = (int16_t)forward_mm,
+        .position_steps = rover_position_steps + (current_dir ? fwd_steps : -fwd_steps),
+        .dir = (uint8_t)current_dir,
         .row = current_row,
     };
     if (xQueueSend(det_queue, &d, 0) != pdTRUE) {
         ESP_LOGW(TAG, "[%s] detection queue full, dropped", src);
         return false;
     }
-    ESP_LOGI(TAG, "[%s] camera sees %s conf=%d%% offset=%dmm", src, DET_NAMES[type], conf, offset_mm);
+    ESP_LOGI(TAG, "[%s] camera sees %s conf=%d%% offset=%dmm ahead=%dmm", src, DET_NAMES[type], conf, offset_mm, forward_mm);
     return true;
 }
 
@@ -542,14 +654,14 @@ static void build_telemetry(char *buf, size_t n) {
         "{\"status\":\"online\",\"state\":\"%s\",\"dir\":\"%s\",\"freq_hz\":%lu,"
         "\"position_m\":%.2f,\"odometer_m\":%.2f,"
         "\"weeds_detected\":%lu,\"weeds_zapped\":%lu,\"diseases\":%lu,\"healthy\":%lu,"
-        "\"row\":%d,\"zone\":%d,\"map\":\"%s\",\"low_conf\":%lu,\"dropped\":%lu,\"blocked\":%lu,\"person\":%d,\"tilt_deg\":%.1f,\"safety\":\"%s\",\"last_det\":\"%s\"}",
+        "\"row\":%d,\"zone\":%d,\"map\":\"%s\",\"low_conf\":%lu,\"dropped\":%lu,\"blocked\":%lu,\"person\":%d,\"tilt_deg\":%.1f,\"armed\":%d,\"pan_deg\":%.1f,\"battery_v\":%.2f,\"battery_pct\":%d,\"battery\":\"%s\",\"safety\":\"%s\",\"last_det\":\"%s\"}",
         STATE_NAMES[rover_state], current_dir ? "FWD" : "REV", (unsigned long)current_freq,
         pos_m, odo_m,
         (unsigned long)cnt_weeds_detected, (unsigned long)cnt_weeds_zapped,
         (unsigned long)cnt_diseases, (unsigned long)cnt_healthy,
         current_row + 1, zone_index_for(rover_position_steps) + 1, map,
         (unsigned long)cnt_low_conf, (unsigned long)cnt_dropped, (unsigned long)cnt_blocked,
-        person_present ? 1 : 0, (double)tilt_deg, SAFETY_NAMES[safety_reason()], ld);
+        person_present ? 1 : 0, (double)tilt_deg, armed ? 1 : 0, (double)pan_aim_deg, (double)batt_v, batt_pct, battery_level_name(), SAFETY_NAMES[safety_reason()], ld);
 }
 
 /* ================================================================
@@ -557,7 +669,7 @@ static void build_telemetry(char *buf, size_t n) {
  * ================================================================ */
 static void print_help(void) {
     printf("\n--- ROVER COMMANDS -------------------------------------\n");
-    printf(" weed     [conf] [offset_mm]   inject weed detection\n");
+    printf(" weed     [conf] [side_mm] [ahead_mm]  inject weed (side -200..200, ahead 0..500)\n");
     printf(" blight   [conf] [offset_mm]   inject blight detection\n");
     printf(" fungal   [conf] [offset_mm]   inject fungal detection\n");
     printf(" nutrient [conf] [offset_mm]   inject nutrient deficiency\n");
@@ -569,27 +681,32 @@ static void print_help(void) {
     printf(" zones                         print the zone map and inspection list\n");
     printf(" zonesjson                     zone data as JSON (for the dashboard)\n");
     printf(" start                         (re)start a mission: clears the zone records\n");
+    printf(" home                          return to base now (it resumes once charged)\n");
+    printf(" batt                          battery voltage and level\n");
     printf(" (conf default 90, offset default random -60..60)\n");
     printf("--------------------------------------------------------\n");
 }
 
 static void handle_command(char *line) {
     char cmd[16] = {0};
-    int a = 0, b = 0;
-    int n = sscanf(line, "%15s %d %d", cmd, &a, &b);
+    int a = 0, b = 0, c = 0;
+    int n = sscanf(line, "%15s %d %d %d", cmd, &a, &b, &c);
     if (n < 1) return;
     for (char *p = cmd; *p; p++) *p = (char)tolower((unsigned char)*p);
 
     int conf = (n >= 2 && a >= 0 && a <= 100) ? a : 90;
     int off  = (n >= 3) ? b : ((int)(esp_random() % 121) - 60);
-    if (off > 100) off = 100;
-    if (off < -100) off = -100;
+    if (off > 200) off = 200;
+    if (off < -200) off = -200;
+    int fwd = (n >= 4) ? c : 100;
+    if (fwd < 0) fwd = 0;
+    if (fwd > 500) fwd = 500;
 
-    if      (!strcmp(cmd, "weed"))     inject_detection(DET_WEED, conf, off, "SERIAL");
-    else if (!strcmp(cmd, "blight"))   inject_detection(DET_BLIGHT, conf, off, "SERIAL");
-    else if (!strcmp(cmd, "fungal"))   inject_detection(DET_FUNGAL, conf, off, "SERIAL");
-    else if (!strcmp(cmd, "nutrient")) inject_detection(DET_NUTRIENT, conf, off, "SERIAL");
-    else if (!strcmp(cmd, "healthy"))  inject_detection(DET_HEALTHY, conf, 0, "SERIAL");
+    if      (!strcmp(cmd, "weed"))     inject_detection(DET_WEED, conf, off, fwd, "SERIAL");
+    else if (!strcmp(cmd, "blight"))   inject_detection(DET_BLIGHT, conf, off, fwd, "SERIAL");
+    else if (!strcmp(cmd, "fungal"))   inject_detection(DET_FUNGAL, conf, off, fwd, "SERIAL");
+    else if (!strcmp(cmd, "nutrient")) inject_detection(DET_NUTRIENT, conf, off, fwd, "SERIAL");
+    else if (!strcmp(cmd, "healthy"))  inject_detection(DET_HEALTHY, conf, 0, 0, "SERIAL");
     else if (!strcmp(cmd, "abort"))    req_abort = true;
     else if (!strcmp(cmd, "estop"))    req_estop = true;
     else if (!strcmp(cmd, "reset"))    req_reset = true;
@@ -600,6 +717,8 @@ static void handle_command(char *line) {
         if (zb) { build_zones_json(zb, ZONES_JSON_BUF); printf("ZONES: %s\n", zb); free(zb); }
     }
     else if (!strcmp(cmd, "start"))    req_start = true;
+    else if (!strcmp(cmd, "home"))     req_home = true;
+    else if (!strcmp(cmd, "batt"))     printf("BATTERY: %.2f V  %d%%  level %s  (rtb at %d%%, laser off at %d%%, resume at %d%%)\n", (double)batt_v, batt_pct, battery_level_name(), BATT_RTB_PCT, BATT_LASER_MIN_PCT, BATT_RESUME_PCT);
     else if (!strcmp(cmd, "safety")) {
         printf("SAFETY DIAG\n");
         printf("  verdict     : %s\n", SAFETY_NAMES[safety_reason()]);
@@ -608,6 +727,7 @@ static void handle_command(char *line) {
         printf("  IMU result  : %s  (imu_ok=%d)\n",
                imu_last_result == IMU_READ_OK ? "OK" : (imu_last_result == IMU_READ_NODATA ? "NODATA (all zero)" : "NOACK (no I2C answer)"), imu_ok);
         printf("  accel g     : x=%.2f y=%.2f z=%.2f\n", (double)imu_ax, (double)imu_ay, (double)imu_az);
+        printf("  armed       : %d  (arming switch on GPIO %d)\n", armed, ARM_PIN);
         printf("  tilt        : %.1f deg  (blocked=%d, limit %.0f / clear %.0f)\n",
                (double)tilt_deg, tilt_blocked, (double)TILT_LIMIT_DEG, (double)TILT_CLEAR_DEG);
     }
@@ -737,15 +857,15 @@ static const char *OLED_NAMES[] = { "NONE", "HEALTHY", "WEED", "BLIGHT", "FUNGAL
 static void render_display(void) {
     sh1107_clear();
     /* Page 0 is partly hidden by the bezel, so the layout uses pages 2-14. Max 16 chars per line. */
-    oled_line(2, "%s %s", STATE_NAMES[rover_state],
-              rover_state == ST_HOLD ? SAFETY_NAMES[safety_reason()] : (current_dir ? "FWD" : "REV"));
+    if (rover_state == ST_HOLD) oled_line(2, "HOLD %s", SAFETY_NAMES[safety_reason()]);
+    else                        oled_line(2, "%s %s %s", STATE_NAMES[rover_state], current_dir ? "FWD" : "REV", armed ? "ARM" : "SAFE");
     oled_line(4, "R%d/%d Z%d/%d %luHZ", current_row + 1, NUM_ROWS, zone_index_for(rover_position_steps) + 1, ZONES_PER_ROW, (unsigned long)current_freq);
     oled_line(6, "POS %.2f M", (float)rover_position_steps / STEPS_PER_METER);
     oled_line(8, "DIST %.1f M", (float)total_steps_traveled / STEPS_PER_METER);
 
     switch (rover_state) {
         case ST_DETECTED: case ST_STOP: case ST_ALIGN: case ST_FIRE:
-        case ST_COOLDOWN: case ST_INSPECT: case ST_HOLD:
+        case ST_COOLDOWN: case ST_INSPECT: case ST_HOLD: case ST_APPROACH:
             oled_line(10, "%s %d%% %dMM", OLED_NAMES[active_det.type], active_det.confidence, active_det.offset_mm);
             break;
         case ST_ESTOP:
@@ -757,13 +877,22 @@ static void render_display(void) {
         case ST_DONE:
             oled_line(10, "MISSION DONE");
             break;
+        case ST_RTB:
+            oled_line(10, "RETURN TO BASE");
+            break;
+        case ST_DOCKED:
+            oled_line(10, "CHARGING TO %d", BATT_RESUME_PCT);
+            break;
+        case ST_RETURN:
+            oled_line(10, "BACK TO WORK");
+            break;
         default:
             if (have_last_det) oled_line(10, "LAST %s %d%%", OLED_NAMES[last_det.type], last_det.confidence);
             else               oled_line(10, "LAST NONE");
             break;
     }
-    if (!imu_ok) oled_line(12, "PIR %d IMU %s", person_present ? 1 : 0, imu_last_result == IMU_READ_NODATA ? "NODATA" : "NOACK");
-    else         oled_line(12, "PIR %d TILT %d", person_present ? 1 : 0, (int)(tilt_deg + 0.5f));
+    if (!imu_ok) oled_line(12, "P%d NOIMU B%d%%", person_present ? 1 : 0, batt_pct);
+    else         oled_line(12, "P%d T%d BAT %d%%", person_present ? 1 : 0, (int)(tilt_deg + 0.5f), batt_pct);
     oled_line(14, "W%lu Z%lu D%lu B%lu",
               (unsigned long)cnt_weeds_detected, (unsigned long)cnt_weeds_zapped,
               (unsigned long)cnt_diseases, (unsigned long)cnt_blocked);
@@ -796,7 +925,7 @@ void app_main(void) {
 
     /* Buttons */
     gpio_config_t btn_conf = {
-        .pin_bit_mask = (1ULL << DIR_BUTTON_PIN) | (1ULL << WEED_BUTTON_PIN) | (1ULL << DISEASE_BUTTON_PIN) | (1ULL << PIR_PIN),
+        .pin_bit_mask = (1ULL << DIR_BUTTON_PIN) | (1ULL << WEED_BUTTON_PIN) | (1ULL << DISEASE_BUTTON_PIN) | (1ULL << PIR_PIN) | (1ULL << ARM_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
@@ -824,12 +953,34 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
+    /* PWM for the pan servo: own timer so the stepper pulses are untouched */
+    ledc_timer_config_t servo_timer = {
+        .speed_mode = LEDC_MODE,
+        .timer_num = SERVO_TIMER,
+        .duty_resolution = LEDC_TIMER_14_BIT,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&servo_timer));
+    ledc_channel_config_t servo_channel = {
+        .speed_mode = LEDC_MODE,
+        .channel = SERVO_CHANNEL,
+        .timer_sel = SERVO_TIMER,
+        .intr_type = LEDC_INTR_DISABLE,
+        .gpio_num = SERVO_PIN,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&servo_channel));
+    servo_write_deg(SERVO_CENTRE_DEG);
+
     /* ADC */
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_control = { .unit_id = ADC_UNIT_1 };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_control, &adc1_handle));
     adc_oneshot_chan_cfg_t adc_config = { .bitwidth = ADC_BITWIDTH_DEFAULT, .atten = ADC_ATTEN_DB_12 };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, POT_ADC_CHANNEL, &adc_config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, BATT_ADC_CHANNEL, &adc_config));
 
     /* OLED */
     ESP_ERROR_CHECK(i2c_bus_init(I2C_MASTER_NUM, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));   // OLED
@@ -848,6 +999,7 @@ void app_main(void) {
     wifi_init_sta();
     start_webserver();
 
+    battery_update(adc1_handle, true);
     enter_state(ST_CRUISE);
 
     int target_dir = 1;
@@ -861,6 +1013,7 @@ void app_main(void) {
         /* ---------- Inputs ---------- */
         adc_oneshot_read(adc1_handle, POT_ADC_CHANNEL, &adc_raw);
         uint32_t pot_freq = 50 + (adc_raw / 2);
+        battery_update(adc1_handle, false);
 
         int b = gpio_get_level(DIR_BUTTON_PIN);
         if (b == 1 && last_dir_btn == 0) {
@@ -871,12 +1024,12 @@ void app_main(void) {
 
         b = gpio_get_level(WEED_BUTTON_PIN);
         if (b == 1 && last_weed_btn == 0)
-            inject_detection(DET_WEED, 90, (int)(esp_random() % 121) - 60, "BTN");
+            inject_detection(DET_WEED, 90, (int)(esp_random() % 121) - 60, 50 + (int)(esp_random() % 101), "BTN");
         last_weed_btn = b;
 
         b = gpio_get_level(DISEASE_BUTTON_PIN);
         if (b == 1 && last_dis_btn == 0)
-            inject_detection(DET_BLIGHT, 85, (int)(esp_random() % 121) - 60, "BTN");
+            inject_detection(DET_BLIGHT, 85, (int)(esp_random() % 121) - 60, 50 + (int)(esp_random() % 101), "BTN");
         last_dis_btn = b;
 
         /* ---------- Safety sensors ---------- */
@@ -903,8 +1056,10 @@ void app_main(void) {
         if (req_abort) {
             req_abort = false;
             if (rover_state != ST_CRUISE && rover_state != ST_RESUME && rover_state != ST_ESTOP &&
-                rover_state != ST_ROWEND && rover_state != ST_DONE) {
+                rover_state != ST_ROWEND && rover_state != ST_DONE &&
+                rover_state != ST_RTB && rover_state != ST_DOCKED && rover_state != ST_RETURN) {
                 ESP_LOGW(TAG, "Engagement aborted by operator.");
+                if (rover_state == ST_APPROACH) target_dir = active_det.dir;
                 enter_state(ST_RESUME);
             }
         }
@@ -926,10 +1081,25 @@ void app_main(void) {
             }
         }
 
+        if (req_home) {
+            req_home = false;
+            if (rover_state == ST_CRUISE || rover_state == ST_RESUME) {
+                ESP_LOGI(TAG, "Operator ordered return to base.");
+                saved_row = current_row; saved_pos = rover_position_steps; saved_dir = current_dir;
+                enter_state(ST_RTB);
+            } else ESP_LOGW(TAG, "home ignored in state %s", STATE_NAMES[rover_state]);
+        }
+
         /* ---------- State machine ---------- */
         detection_t d;
         switch (rover_state) {
             case ST_CRUISE:
+                if (batt_pct <= BATT_RTB_PCT) {
+                    ESP_LOGW(TAG, "Battery %d%% - returning to base. Will resume at row %d.", batt_pct, current_row + 1);
+                    saved_row = current_row; saved_pos = rover_position_steps; saved_dir = current_dir;
+                    enter_state(ST_RTB);
+                    break;
+                }
                 if (row_end_reached()) { enter_state(ST_ROWEND); break; }
                 if (xQueueReceive(det_queue, &d, 0) == pdTRUE) {
                     if (process_detection(&d)) {
@@ -949,20 +1119,41 @@ void app_main(void) {
             case ST_STOP:
                 drain_queue_dropped("busy");
                 if (current_freq == 0) {
-                    enter_state(active_det.type == DET_WEED ? ST_ALIGN : ST_INSPECT);
+                    if (active_det.type != DET_WEED) { enter_state(ST_INSPECT); break; }
+                    approach_goal = active_det.position_steps;
+                    if (!transit_arrived(approach_goal, approach_goal > rover_position_steps)) {
+                        ESP_LOGI(TAG, "Driving %d mm to bring the weed level with the laser.", active_det.forward_mm);
+                        enter_state(ST_APPROACH);
+                    } else enter_state(ST_ALIGN);
+                }
+                break;
+
+            case ST_APPROACH:
+                drain_queue_dropped("busy");
+                target_dir = (approach_goal > rover_position_steps) ? 1 : 0;
+                if (transit_arrived(approach_goal, target_dir)) {
+                    target_dir = active_det.dir;                         // go back to the row heading afterwards
+                    enter_state(ST_ALIGN);
                 }
                 break;
 
             case ST_ALIGN: {
                 drain_queue_dropped("busy");
+                if (!aim_reachable) {
+                    ESP_LOGW(TAG, "Target %d mm to the side is out of turret reach (%.0f deg limit) - skipped.",
+                             active_det.offset_mm, (double)PAN_LIMIT_DEG);
+                    cnt_blocked++;
+                    zone_for(&active_det)->weeds_blocked++;
+                    enter_state(ST_RESUME);
+                    break;
+                }
                 if (safety_reason() != SAFE_OK) {
                     ESP_LOGW(TAG, "FIRE BLOCKED: %s - holding up to %d s", SAFETY_NAMES[safety_reason()], HOLD_TIMEOUT_MS / 1000);
                     enter_state(ST_HOLD);
                     break;
                 }
-                int mm = active_det.offset_mm < 0 ? -active_det.offset_mm : active_det.offset_mm;
-                if (state_elapsed_ms() >= (uint32_t)(ALIGN_BASE_MS + mm * ALIGN_PER_MM_MS)) {
-                    ESP_LOGI(TAG, "Aimed at offset %d mm. LASER ON (simulated)", active_det.offset_mm);
+                if (fabsf(pan_cur - pan_cmd) < 0.5f && state_elapsed_ms() >= ALIGN_SETTLE_MS) {
+                    ESP_LOGI(TAG, "Turret aimed at %.1f deg (%d mm to the side). LASER ON (simulated)", (double)pan_aim_deg, active_det.offset_mm);
                     enter_state(ST_FIRE);
                 }
                 break;
@@ -1013,6 +1204,12 @@ void app_main(void) {
                 break;
 
             case ST_RESUME:
+                if (batt_pct <= BATT_RTB_PCT) {
+                    ESP_LOGW(TAG, "Battery %d%% - returning to base. Will resume at row %d.", batt_pct, current_row + 1);
+                    saved_row = current_row; saved_pos = rover_position_steps; saved_dir = current_dir;
+                    enter_state(ST_RTB);
+                    break;
+                }
                 if (row_end_reached()) { enter_state(ST_ROWEND); break; }
                 drain_queue_dropped("holdoff");
                 if (state_elapsed_ms() >= RESUME_HOLDOFF_MS) enter_state(ST_CRUISE);
@@ -1040,6 +1237,34 @@ void app_main(void) {
                 drain_queue_dropped("mission done");
                 break;
 
+            case ST_RTB:
+                drain_queue_dropped("returning");
+                target_dir = (rover_position_steps > 0) ? 0 : 1;          // head for position 0 (the dock)
+                if (transit_arrived(0, target_dir)) {
+                    ESP_LOGI(TAG, "At base. Charging until %d%% (battery now %d%%).", BATT_RESUME_PCT, batt_pct);
+                    enter_state(ST_DOCKED);
+                }
+                break;
+
+            case ST_DOCKED:
+                drain_queue_dropped("docked");
+                if (state_elapsed_ms() >= DOCK_MIN_MS && batt_pct >= BATT_RESUME_PCT) {
+                    ESP_LOGI(TAG, "Charged (%d%%). Returning to row %d.", batt_pct, saved_row + 1);
+                    enter_state(ST_RETURN);
+                }
+                break;
+
+            case ST_RETURN:
+                drain_queue_dropped("returning");
+                target_dir = (saved_pos > rover_position_steps) ? 1 : 0;
+                if (transit_arrived(saved_pos, target_dir)) {
+                    current_row = saved_row;
+                    target_dir = saved_dir;
+                    ESP_LOGI(TAG, "Back at work, row %d. Continuing mission.", current_row + 1);
+                    enter_state(ST_RESUME);
+                }
+                break;
+
             case ST_ESTOP:
                 drain_queue_dropped("estop");
                 break;
@@ -1048,6 +1273,15 @@ void app_main(void) {
         /* ---------- Motor control ---------- */
         bool drive = (rover_state == ST_CRUISE || rover_state == ST_RESUME);
         uint32_t target_freq = drive ? pot_freq : 0;
+        bool transit = (rover_state == ST_RTB || rover_state == ST_RETURN || rover_state == ST_APPROACH);
+        if (transit) {
+            int32_t goal = (rover_state == ST_RTB) ? 0 : (rover_state == ST_RETURN ? saved_pos : approach_goal);
+            int32_t rem = goal - rover_position_steps;
+            if (rem < 0) rem = -rem;
+            uint32_t cap = 100 + (uint32_t)rem / 4;                       // slow down on approach
+            uint32_t maxf = (rover_state == ST_APPROACH) ? APPROACH_FREQ_HZ_MAX : TRANSIT_FREQ_HZ;
+            target_freq = cap < maxf ? cap : maxf;
+        }
         if (drive) {                                          // slow down near the end of the row
             int32_t to_end = current_dir ? (ROW_LENGTH_STEPS - rover_position_steps) : rover_position_steps;
             if (to_end < (int32_t)(APPROACH_ZONE_M * STEPS_PER_METER) && target_freq > APPROACH_FREQ_HZ)
@@ -1077,14 +1311,17 @@ void app_main(void) {
             uint32_t steps = step_accum / 1000;
             step_accum %= 1000;
             total_steps_traveled += steps;
-            row_travel_steps += steps;
+            if (rover_state != ST_RTB && rover_state != ST_RETURN && rover_state != ST_APPROACH) row_travel_steps += steps;
             if (current_dir) rover_position_steps += (int32_t)steps;
             else             rover_position_steps -= (int32_t)steps;
         }
 
         /* ---------- Mark the zone the rover is in as scanned ---------- */
-        if (rover_state != ST_DONE && rover_state != ST_ESTOP)
+        if (rover_state != ST_DONE && rover_state != ST_ESTOP && rover_state != ST_RTB &&
+            rover_state != ST_DOCKED && rover_state != ST_RETURN)
             zones[current_row][zone_index_for(rover_position_steps)].visited = true;
+
+        servo_slew();
 
         /* ---------- Hard laser interlock: on only in FIRE and only when safe ---------- */
         gpio_set_level(LASER_LED_PIN, (rover_state == ST_FIRE && safety_reason() == SAFE_OK) ? 1 : 0);
